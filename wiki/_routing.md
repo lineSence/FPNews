@@ -87,6 +87,14 @@ triggers:
       - wiki/rules/scraping.md
       - wiki/rules/legal.md
 
+  - id: news-latency
+    keywords: [новости, лента, rss, задержка, скорость доставки, сторож, опрос, медуза, фонтанка, спин-офф, дубли, досылка]
+    load:
+      - docs/news-overview.md
+      - docs/news-architecture.md
+      - docs/news-sources.md
+      - wiki/rules/news.md
+
   - id: hr-bullshit-detector
     keywords: [hr-брехня, клише, дружная команда, правдивость, отзывы, dream job, досье, компания]
     load:
