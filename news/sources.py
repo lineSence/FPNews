@@ -19,6 +19,7 @@ JUNK_PARAMS = ("utm_", "from", "ysclid", "erid", "fbclid", "gclid")
 # Ссылка на материал Фонтанки: /2026/09/24/76658444/. Год и число знаков
 # проверяются, потому что этому же шаблону не должны соответствовать разделы.
 FONTANKA_ITEM = re.compile(r"/(20\d\d)/(\d\d)/(\d\d)/(\d{6,9})/?$")
+CONTENT = "{http://purl.org/rss/1.0/modules/content/}encoded"
 ANCHOR = re.compile(r"<a\b[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>", re.S | re.I)
 TAG = re.compile(r"<[^>]+>|<!--.*?-->", re.S)
 SPACE = re.compile(r"\s+")
@@ -26,11 +27,24 @@ SPACE = re.compile(r"\s+")
 
 @dataclass(frozen=True)
 class Found:
-    """Одна строчка списка: что вообще можно узнать, не открывая материал."""
+    """Одна строчка списка: что вообще можно узнать, не открывая материал.
+
+    У Медузы в ленте лежит весь текст материала (`content:encoded`), поэтому
+    `body` приходит заполненным и заходить на страницу не нужно вовсе — минус
+    одно сетевое обращение на каждой новости. У Фонтанки в списке только адрес
+    и заголовок, текст качается отдельно.
+    """
 
     url: str
     title: str = ""
     published_at: str = ""
+    lead: str = ""
+    body: str = ""
+
+    @property
+    def whole(self) -> bool:
+        """Материал пришёл целиком: разбор страницы не нужен."""
+        return bool(self.body)
 
 
 @dataclass(frozen=True)
@@ -131,11 +145,15 @@ def _from_rss(body: str, source: Source) -> list[Found]:
         if not link or link in seen:
             continue
         seen.add(link)
+        body = text_of(item.findtext(CONTENT) or "")
+        lead = text_of(item.findtext("description") or "")
         out.append(
             Found(
                 url=link,
                 title=(item.findtext("title") or "").strip(),
                 published_at=(item.findtext("pubDate") or "").strip(),
+                lead=lead or body[:400],
+                body=body,
             )
         )
     return out

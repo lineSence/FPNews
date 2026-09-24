@@ -38,7 +38,8 @@ SCHEMA = (
         listed_at     TEXT,                   -- увидели адрес в ленте
         fetched_at    TEXT,                   -- скачали и разобрали текст
         sent_at       TEXT,                   -- ушло сырое сообщение
-        enriched_at   TEXT                    -- ушло дополнение
+        enriched_at   TEXT,                   -- ушло дополнение
+        cold          INTEGER NOT NULL DEFAULT 0  -- подобрано на холодном старте
     )
     """,
     "CREATE INDEX IF NOT EXISTS items_listed ON items(listed_at)",
@@ -114,22 +115,73 @@ def ensure(conn: sqlite3.Connection) -> None:
 
 
 def remember(conn: sqlite3.Connection, source: str, url: str, title: str, listed_at: str,
-             published_at: str = "") -> tuple[int, bool]:
+             published_at: str = "", cold: bool = False) -> tuple[int, bool]:
     """Записывает найденный адрес. Возвращает (id, новая ли).
 
     Момент обнаружения (`listed_at`) ставится один раз и больше не трогается:
     он и есть точка отсчёта нашей задержки. Заголовок из ленты может позже
     уточниться разбором страницы, время обнаружения — нет.
+
+    `cold` — новость подобрана на первом заходе, то есть лежала в ленте ещё до
+    запуска. Её «редакционная задержка» равна возрасту ленты, а не скорости
+    издания, и в статистику такие не идут: иначе первый же старт показал бы
+    шесть часов и обесценил все остальные цифры [NEWS-001]. Рассылать их тоже
+    нельзя — пользователь получил бы пачку вчерашнего.
     """
     row = conn.execute("SELECT id FROM items WHERE url = ?", (url,)).fetchone()
     if row is not None:
         return int(row["id"]), False
     cursor = conn.execute(
-        "INSERT INTO items(url, source, title, published_at, listed_at) VALUES(?,?,?,?,?)",
-        (url, source, title, published_at or None, listed_at),
+        "INSERT INTO items(url, source, title, published_at, listed_at, cold) "
+        "VALUES(?,?,?,?,?,?)",
+        (url, source, title, published_at or None, listed_at, 1 if cold else 0),
     )
     conn.commit()
     return int(cursor.lastrowid or 0), True
+
+
+def fill(conn: sqlite3.Connection, item_id: int, lead: str, body: str, fetched_at: str) -> None:
+    """Текст материала и метка разбора. Пустым текстом ничего не затираем."""
+    if not (lead or body):
+        return
+    conn.execute(
+        "UPDATE items SET lead = ?, body = ?, fetched_at = ? WHERE id = ?",
+        (lead, body, fetched_at, item_id),
+    )
+    conn.commit()
+
+
+def now() -> str:
+    """Единый вид времени в базе: UTC по ISO, с точностью до микросекунд.
+
+    Точность важнее красоты: задержки здесь меряются секундами, и округление
+    до секунды съело бы половину измеряемой величины [NEWS-001].
+    """
+    from datetime import datetime, timezone  # noqa: PLC0415 — нужен только здесь
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+def published(raw: str) -> str:
+    """Время публикации из ленты в наш вид. Непонятное — пустая строка.
+
+    В RSS оно приходит по RFC 2822 («Thu, 24 Sep 2026 22:34:08 +0300»), и без
+    разбора редакционную задержку посчитать не из чего.
+    """
+    from email.utils import parsedate_to_datetime  # noqa: PLC0415
+
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    try:
+        return parsedate_to_datetime(text).isoformat()
+    except (TypeError, ValueError):
+        try:
+            from datetime import datetime  # noqa: PLC0415
+
+            return datetime.fromisoformat(text).isoformat()
+        except ValueError:
+            return ""
 
 
 def stamp(conn: sqlite3.Connection, item_id: int, field: str, when: str) -> None:
@@ -144,7 +196,7 @@ def latency_rows(conn: sqlite3.Connection, limit: int = 500) -> list[dict[str, A
     """Задержки последних новостей в секундах: редакционная, наша, до полного."""
     rows = conn.execute(
         "SELECT url, source, published_at, listed_at, sent_at, enriched_at "
-        "FROM items WHERE listed_at IS NOT NULL ORDER BY listed_at DESC LIMIT ?",
+        "FROM items WHERE listed_at IS NOT NULL AND cold = 0 ORDER BY listed_at DESC LIMIT ?",
         (limit,),
     ).fetchall()
     out: list[dict[str, Any]] = []
@@ -161,6 +213,26 @@ def latency_rows(conn: sqlite3.Connection, limit: int = 500) -> list[dict[str, A
     return out
 
 
+PAIRS = {
+    "редакционная": ("published_at", "listed_at"),
+    "до_отправки": ("listed_at", "sent_at"),
+    "до_полного": ("sent_at", "enriched_at"),
+}
+
+
+def latency_of(conn: sqlite3.Connection, item_id: int, kind: str) -> float | None:
+    """Одна задержка одной новости в секундах. Нет метки — None, не ноль.
+
+    Ноль вместо «не знаем» испортил бы статистику молча, а это худший вид
+    ошибки в измерениях [NEWS-001].
+    """
+    first, second = PAIRS[kind]
+    row = conn.execute(
+        "SELECT {}, {} FROM items WHERE id = ?".format(first, second), (item_id,)
+    ).fetchone()
+    return _delta(row[0], row[1]) if row is not None else None
+
+
 def _delta(first: Any, second: Any) -> float | None:
     from datetime import datetime  # noqa: PLC0415 — нужен только здесь
 
@@ -174,5 +246,5 @@ def _delta(first: Any, second: Any) -> float | None:
     return round((end - start).total_seconds(), 3)
 
 
-__all__ = ("CACHE_KB", "DEFAULT_PATH", "SCHEMA", "STAMPS", "connect", "ensure",
-           "latency_rows", "remember", "stamp")
+__all__ = ("CACHE_KB", "DEFAULT_PATH", "SCHEMA", "STAMPS", "connect", "ensure", "fill",
+           "latency_of", "latency_rows", "now", "published", "remember", "stamp")
