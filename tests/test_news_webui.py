@@ -216,3 +216,38 @@ def test_форма_без_метки_объясняет_причину(tmp_path
     token = web.new_session(conn, 7)
     ответ = _post(conn, "/запросы/добавить", token, "метка=старая&запрос=тариф")
     assert ответ.status.startswith("400") and "сессия сменилась" in ответ.body
+
+
+def test_главная_это_сводка_за_сутки(tmp_path: Path) -> None:
+    """Первым экраном — наблюдения: цифры, снятия с «прожило», правки с цитатой."""
+    conn = _db(tmp_path)
+    token = web.new_session(conn, 7)
+    номер, _ = store.remember(conn, "fontanka", "https://f/7", "Мост закрыт", store.now())
+    store.fill(conn, номер, "", "Подрядчик обещал закончить работы до конца апреля.",
+               store.now())
+    store.revise(conn, номер, "Мост закрыт", 40, "отпечаток",
+                 "Подрядчик обещал закончить работы до конца апреля и не закончил.")
+    store.save_snapshot(conn, номер, "<html>копия страницы</html>")
+    store.mark_gone(conn, номер, 404)
+    тело = _get(conn, "/", token).body
+    assert "Что происходило за сутки" in тело
+    assert "материалов" in тело and "медиана до нас" in тело
+    assert "прожило" in тело and "снято с публикации" in тело
+    assert "Сохранённые запросы" in тело and "Что уходит в Telegram" in тело
+    assert "Тем пока нет" not in тело, "настройки тем уехали на отдельную страницу"
+
+
+def test_темы_живут_на_своей_странице(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    token = web.new_session(conn, 7)
+    bot_module.add_topic(conn, 7, "набережная")
+    страница = _get(conn, "/темы", token)
+    assert страница.status.startswith("200") and "набережная" in страница.body
+    assert 'href="/темы" class=тут' in страница.body
+
+
+def test_неизвестное_не_показывается_нулём(tmp_path: Path) -> None:
+    """Пустая база: цифры, которых мы не знаем, — прочерк, а не ноль [NEWS-001]."""
+    conn = _db(tmp_path)
+    тело = _get(conn, "/", web.new_session(conn, 7)).body
+    assert "—" in тело and "медиана до нас" in тело
