@@ -37,7 +37,6 @@ log = logging.getLogger("fpnews.web")
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 6769
-SCHEME = "http://"
 # Запрос без тела больше этого — не наш: формы здесь по сотне байт.
 MAX_BODY = 64 * 1024
 COOKIE = "fpnews"
@@ -57,8 +56,7 @@ def port() -> int:
 
 def base_url() -> str:
     """Адрес, который бот присылает в сообщении со ссылкой на вход."""
-    local = SCHEME + "{}:{}".format(host(), port())
-    return (os.getenv("FPNEWS_WEB_URL") or local).rstrip("/")
+    return (os.getenv("FPNEWS_WEB_URL") or "http://{}:{}".format(host(), port())).rstrip("/")
 
 
 @dataclass
@@ -320,6 +318,6 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ("COOKIE", "DEFAULT_HOST", "DEFAULT_PORT", "Request", "Response", "SCHEME",
+__all__ = ("COOKIE", "DEFAULT_HOST", "DEFAULT_PORT", "Request", "Response",
            "base_url", "code_for", "cookie_value", "csrf", "handle", "host", "new_session",
            "parse", "main", "port", "redeem", "redirect", "route", "serve", "whoami")

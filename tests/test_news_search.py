@@ -118,3 +118,54 @@ def test_карточка_материала(conn):
     assert len(карточка["правки"]) == 1
     assert карточка["сюжет"] is None
     assert search.item(conn, 10_000) is None
+
+
+def test_служебные_отметки_не_трогают_индекс(conn):
+    """Триггер обновления висит только на тексте, а не на любом поле."""
+    search.ensure_index(conn)
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'items_fts_au'"
+    ).fetchone()[0]
+    assert "UPDATE OF title, lead, body" in sql
+    item_id = добавить(conn, "meduza", "https://m/2", "Разводка мостов")
+    # total_changes считает и строки, записанные триггерами: одна строка —
+    # значит, индекс не переписывался.
+    before = conn.total_changes
+    conn.execute("UPDATE items SET sent_at = '2026-09-25T10:01:00+00:00', checks = 1 "
+                 "WHERE id = ?", (item_id,))
+    assert conn.total_changes - before == 1
+    before = conn.total_changes
+    conn.execute("UPDATE items SET title = 'Разводка мостов отменена' WHERE id = ?", (item_id,))
+    assert conn.total_changes - before > 1
+    assert search.search(conn, "отменена")
+
+
+def test_старый_триггер_заменяется(conn):
+    """База, созданная до правки, получает узкий триггер при первом поиске."""
+    search.ensure_index(conn)
+    conn.execute("DROP TRIGGER items_fts_au")
+    conn.execute(
+        "CREATE TRIGGER items_fts_au AFTER UPDATE ON items BEGIN "
+        "INSERT INTO items_fts(items_fts, rowid, title, lead, body) "
+        "VALUES ('delete', old.id, old.title, old.lead, old.body); "
+        "INSERT INTO items_fts(rowid, title, lead, body) "
+        "VALUES (new.id, new.title, new.lead, new.body); END"
+    )
+    conn.commit()
+    search.search(conn, "мост")
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'items_fts_au'"
+    ).fetchone()[0]
+    assert "UPDATE OF" in sql
+
+
+def test_поиск_по_теме(conn):
+    from news import bot as bot_module
+
+    bot_module.add_topic(conn, 7, "дрон")
+    topic_id = conn.execute("SELECT id FROM topics WHERE user_id = 7").fetchone()["id"]
+    добавить(conn, "fontanka", "https://f/10", "Дроны над заливом, метро закрыто")
+    добавить(conn, "fontanka", "https://f/11", "Метро откроется позже")
+    найдено = search.search(conn, "метро", topic_id=topic_id)
+    assert [р["url"] for р in найдено] == ["https://f/10"]
+    assert search.search(conn, "метро", topic_id=topic_id + 100) == []

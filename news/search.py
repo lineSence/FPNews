@@ -23,6 +23,8 @@ MAX_LIMIT = 200
 # а полноценный стеммер тянет за собой зависимость.
 PREFIX_FROM = 4
 
+UPDATE_OF = re.compile(r"AFTER\s+UPDATE\s+OF\b", re.I)
+
 INDEX_SQL = (
     """
     CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
@@ -44,7 +46,7 @@ INDEX_SQL = (
     END
     """,
     """
-    CREATE TRIGGER IF NOT EXISTS items_fts_au AFTER UPDATE ON items BEGIN
+    CREATE TRIGGER IF NOT EXISTS items_fts_au AFTER UPDATE OF title, lead, body ON items BEGIN
         INSERT INTO items_fts(items_fts, rowid, title, lead, body)
         VALUES ('delete', old.id, old.title, old.lead, old.body);
         INSERT INTO items_fts(rowid, title, lead, body)
@@ -59,13 +61,30 @@ def ensure_index(conn: sqlite3.Connection) -> None:
 
     Первое создание сопровождается `rebuild`: иначе всё, что накопилось до
     появления поиска, молча осталось бы ненаходимым.
+
+    Триггер обновления висит только на `title, lead, body`: отметки
+    `sent_at`, `checks`, `checked_at` и прочие служебные поля меняются
+    постоянно и не должны переписывать индекс. Старый триггер «на любое
+    обновление» из уже созданных баз заменяется здесь же.
+
+    Вызывается на каждом поиске, поэтому в обычном случае это одно чтение
+    `sqlite_master` без записи и без `commit`.
     """
-    have = conn.execute(
-        "SELECT name FROM sqlite_master WHERE name = 'items_fts'"
-    ).fetchone()
+    have = {
+        str(row[0]): str(row[1] or "")
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE name IN "
+            "('items_fts', 'items_fts_ai', 'items_fts_ad', 'items_fts_au')"
+        )
+    }
+    if "items_fts_au" in have and not UPDATE_OF.search(have["items_fts_au"]):
+        conn.execute("DROP TRIGGER items_fts_au")
+        del have["items_fts_au"]
+    if len(have) == 4:
+        return
     for statement in INDEX_SQL:
         conn.execute(statement)
-    if have is None:
+    if "items_fts" not in have:
         conn.execute("INSERT INTO items_fts(items_fts) VALUES('rebuild')")
     conn.commit()
 
@@ -115,7 +134,7 @@ def search(conn: sqlite3.Connection, query: str, *, source: str = "",
     if not expression:
         return []
     params: list[Any] = []
-    where = ["f MATCH ?"]
+    where = ["items_fts MATCH ?"]
 
     if topic_id is not None:
         topic = conn.execute(
@@ -150,8 +169,8 @@ def search(conn: sqlite3.Connection, query: str, *, source: str = "",
     sql = (
         "SELECT i.id, i.url, i.source, i.title, i.lead, i.published_at, i.listed_at, "
         "i.dup_of, (SELECT COUNT(*) FROM item_revisions r WHERE r.item_id = i.id) AS revisions "
-        "FROM items_fts f JOIN items i ON i.id = f.rowid WHERE {} "
-        "ORDER BY bm25(f, 4.0, 2.0, 1.0), COALESCE(i.published_at, i.listed_at) DESC "
+        "FROM items_fts JOIN items i ON i.id = items_fts.rowid WHERE {} "
+        "ORDER BY bm25(items_fts, 4.0, 2.0, 1.0), COALESCE(i.published_at, i.listed_at) DESC "
         "LIMIT ? OFFSET ?".format(" AND ".join(where))
     )
     params.append(max(1, min(int(limit), MAX_LIMIT)))
