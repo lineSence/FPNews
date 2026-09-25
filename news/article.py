@@ -27,6 +27,12 @@ log = logging.getLogger("fpnews.article")
 LD = re.compile(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', re.S | re.I)
 META = re.compile(r'<meta[^>]+property="(og:[a-z:]+)"[^>]+content="([^"]*)"', re.I)
 PARA = re.compile(r"<p[^>]*>(.*?)</p>", re.S | re.I)
+# Запасной вариант запасного: РИА верстает абзацы не тегом <p>, а блоками
+# `div.article__text`, и без этого от их молний остаётся пустой текст. По
+# классам мы разбирать не любим (они меняются), но здесь это последняя
+# попытка перед пустотой, и имя класса сужено до «article…text», чтобы не
+# затащить форму регистрации и подвал [NEWS-004].
+BLOCK = re.compile(r'<div[^>]+class="[^"]*article[^"]*text[^"]*"[^>]*>(.*?)</div>', re.S | re.I)
 LEAD_LIMIT = 400
 
 
@@ -70,11 +76,20 @@ def parse(body: str) -> Parsed:
     return _fallback(body)
 
 
+SCRIPT = re.compile(r"<(script|style)\b.*?</\1>", re.S | re.I)
+
+
 def _fallback(body: str) -> Parsed:
     """Запасной разбор: Open Graph плюс абзацы. Хуже, но лучше пустоты."""
     meta = {key.lower(): html_lib.unescape(value) for key, value in META.findall(body or "")}
+    # Скрипты выбрасываем до разбора: иначе в «текст материала» попадает
+    # разметка для поисковиков и счётчики.
+    body = SCRIPT.sub(" ", body or "")
     chunks = [sources.text_of(chunk) for chunk in PARA.findall(body or "")]
     text = " ".join(chunk for chunk in chunks if len(chunk) > 40)
+    if not text:
+        blocks = [sources.text_of(chunk) for chunk in BLOCK.findall(body or "")]
+        text = " ".join(chunk for chunk in blocks if len(chunk) > 40)
     lead = meta.get("og:description", "") or text[:LEAD_LIMIT]
     return Parsed(
         title=meta.get("og:title", "").strip(),
@@ -93,4 +108,4 @@ async def load(session: Any, url: str) -> Parsed:
     return parse(poll.body)
 
 
-__all__ = ("Parsed", "load", "parse")
+__all__ = ("BLOCK", "Parsed", "SCRIPT", "load", "parse")

@@ -20,6 +20,9 @@ JUNK_PARAMS = ("utm_", "from", "ysclid", "erid", "fbclid", "gclid")
 # проверяются, потому что этому же шаблону не должны соответствовать разделы.
 FONTANKA_ITEM = re.compile(r"/(20\d\d)/(\d\d)/(\d\d)/(\d{6,9})/?$")
 CONTENT = "{http://purl.org/rss/1.0/modules/content/}encoded"
+# Деловой Петербург кладёт полный текст в тег для Яндекса. Нам он тоже
+# годится: это тот же материал, и он снимает поход на страницу.
+YANDEX_FULL = "{http://news.yandex.ru}full-text"
 ANCHOR = re.compile(r"<a\b[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>", re.S | re.I)
 TAG = re.compile(r"<[^>]+>|<!--.*?-->", re.S)
 SPACE = re.compile(r"\s+")
@@ -64,6 +67,10 @@ class Source:
     conditional: bool
     fallback: str = ""
     host: str = ""
+    # Пометка, которую обязан нести пересказ материала (например, статус
+    # иностранного агента). Живёт в описании источника, а не в шаблоне
+    # сообщения: это свойство издания [NEWS-005].
+    notice: str = ""
 
 
 MEDUZA = Source(
@@ -75,6 +82,7 @@ MEDUZA = Source(
     conditional=True,
     fallback="https://meduza.io/api/w5/screens/news?locale=ru",
     host="https://meduza.io",
+    notice="издание признано в РФ иностранным агентом",
 )
 
 FONTANKA = Source(
@@ -88,7 +96,70 @@ FONTANKA = Source(
     host="https://www.fontanka.ru",
 )
 
-ALL = (MEDUZA, FONTANKA)
+INTERFAX = Source(
+    code="interfax",
+    label="Интерфакс",
+    # Лучшая дверь из всех измеренных: 5,8 КБ, треть секунды, честный
+    # Last-Modified. Повтор стоит ноль байт, поэтому интервал маленький.
+    door="https://www.interfax.ru/rss",
+    kind="rss",
+    interval=10.0,
+    conditional=True,
+    host="https://www.interfax.ru",
+)
+
+DP = Source(
+    code="dp",
+    label="Деловой Петербург",
+    # Ответ дорогой: 210 КБ и секунда-четыре. Валидаторы дверь отдаёт, но
+    # перегенерирует ленту постоянно, поэтому 304 приходит редко — отсюда
+    # интервал вдвое крупнее прочих. Зато текст материала есть прямо в ленте,
+    # и страницу открывать не нужно.
+    door="https://www.dp.ru/exportnews.xml",
+    kind="rss",
+    interval=30.0,
+    conditional=True,
+    host="https://www.dp.ru",
+)
+
+RIA = Source(
+    code="ria",
+    label="РИА Новости",
+    # В ленте только заголовок и адрес — за текстом идём на страницу.
+    door="https://ria.ru/export/rss2/archive/index.xml",
+    kind="rss",
+    interval=15.0,
+    conditional=False,
+    host="https://ria.ru",
+)
+
+MOIKA = Source(
+    code="moika",
+    label="Мойка78",
+    # Всего десять записей в ленте: при всплеске новостей она вымывается за
+    # минуты, поэтому опрашивать реже нельзя — пропуск дороже трафика
+    # [NEWS-004].
+    door="https://moika78.ru/feed/",
+    kind="rss",
+    interval=15.0,
+    conditional=False,
+    host="https://moika78.ru",
+)
+
+PAPER = Source(
+    code="paper",
+    label="Бумага",
+    # Домен paperpaper.ru продан: там теперь сайт про микрозаймы. Издание
+    # живёт на .io, лента обычная вордпрессовская, с текстом целиком.
+    door="https://paperpaper.io/feed/",
+    kind="rss",
+    interval=15.0,
+    conditional=True,
+    host="https://paperpaper.io",
+    notice="издание признано в РФ иностранным агентом",
+)
+
+ALL = (MEDUZA, FONTANKA, INTERFAX, DP, RIA, MOIKA, PAPER)
 BY_CODE = {source.code: source for source in ALL}
 
 
@@ -145,7 +216,7 @@ def _from_rss(body: str, source: Source) -> list[Found]:
         if not link or link in seen:
             continue
         seen.add(link)
-        body = text_of(item.findtext(CONTENT) or "")
+        body = text_of(item.findtext(CONTENT) or item.findtext(YANDEX_FULL) or "")
         lead = text_of(item.findtext("description") or "")
         out.append(
             Found(
@@ -182,7 +253,13 @@ def _from_html(body: str, source: Source) -> list[Found]:
 __all__ = (
     "ALL",
     "BY_CODE",
+    "DP",
     "FONTANKA",
+    "INTERFAX",
+    "MOIKA",
+    "PAPER",
+    "RIA",
+    "YANDEX_FULL",
     "Found",
     "MEDUZA",
     "Source",

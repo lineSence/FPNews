@@ -16,11 +16,14 @@ import logging
 import sqlite3
 from typing import Any
 
-from . import enrich, store, topics
+from . import enrich, sources, store, topics
 
 log = logging.getLogger("fpnews.deliver")
 
-LABEL = {"meduza": "Медуза", "fontanka": "Фонтанка"}
+# Названия изданий берутся из описания источников, а не дублируются здесь:
+# добавили источник в одном месте — он назвался правильно везде.
+LABEL = {source.code: source.label for source in sources.ALL}
+NOTICE = {source.code: source.notice for source in sources.ALL if source.notice}
 
 
 def subscribers(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -40,11 +43,13 @@ def message(item: dict[str, Any], hit: topics.Hit) -> str:
     source = LABEL.get(str(item.get("source")), str(item.get("source")))
     title = html.escape(str(item.get("title") or "без заголовка"))
     words = ", ".join(hit.words[:4])
+    mark = NOTICE.get(str(item.get("source")))
     return (
         "<b>{title}</b>\n"
-        "{source} · тема «{topic}» — {where}: {words}\n"
+        "{source}{mark} · тема «{topic}» — {where}: {words}\n"
         "{url}"
     ).format(
+        mark=" ({})".format(mark) if mark else "",
         title=title,
         source=source,
         topic=html.escape(hit.title),
@@ -57,12 +62,14 @@ def message(item: dict[str, Any], hit: topics.Hit) -> str:
 def also_message(item: dict[str, Any], original: dict[str, Any]) -> str:
     """Второе сообщение по тому же событию: коротко и со ссылкой."""
     source = LABEL.get(str(item.get("source")), str(item.get("source")))
+    mark = NOTICE.get(str(item.get("source")))
     return (
-        "<i>Тоже написали</i> — {source}\n"
+        "<i>Тоже написали</i> — {source}{mark}\n"
         "<b>{title}</b>\n{url}\n\n"
         "Об этом же: {first}"
     ).format(
         source=source,
+        mark=" ({})".format(mark) if mark else "",
         title=html.escape(str(item.get("title") or "")),
         url=item.get("url"),
         first=original.get("url"),
@@ -185,5 +192,5 @@ def record(conn: sqlite3.Connection, item_id: int, user_id: int, topic_id: int, 
         pass
 
 
-__all__ = ("LABEL", "already", "also_message", "message", "record", "send_also",
+__all__ = ("LABEL", "NOTICE", "already", "also_message", "message", "record", "send_also",
            "send_change", "send_item", "subscribers")

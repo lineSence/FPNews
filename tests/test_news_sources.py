@@ -57,4 +57,72 @@ def test_у_каждого_источника_своя_политика() -> Non
     """[NEWS-005]: общей настройки интервала не существует."""
     assert sources.MEDUZA.conditional and sources.MEDUZA.interval <= 10
     assert not sources.FONTANKA.conditional and sources.FONTANKA.interval >= 15
-    assert all(source.fallback for source in sources.ALL)
+    assert sources.MEDUZA.fallback and sources.FONTANKA.fallback, "у тяжёлых дверей есть запасная"
+    # Дверь, интервал и условный запрос описаны у каждого, кодов не дублируется.
+    assert len({source.code for source in sources.ALL}) == len(sources.ALL)
+    assert all(source.door.startswith("https://") and source.interval >= 10
+               for source in sources.ALL)
+
+
+def test_ленты_с_текстом_целиком() -> None:
+    """Где текст есть в ленте, поход на страницу не нужен."""
+    поток = (
+        '<rss xmlns:content="http://purl.org/rss/1.0/modules/content/" '
+        'xmlns:yandex="http://news.yandex.ru"><channel>'
+        "<item><title>Полиция пришла с проверкой</title>"
+        "<link>https://paperpaper.io/papernews/2026/9/25/policiya/</link>"
+        "<pubDate>Fri, 25 Sep 2026 07:50:10 +0000</pubDate>"
+        "<content:encoded>&lt;p&gt;Сотрудники пришли утром.&lt;/p&gt;</content:encoded>"
+        "</item></channel></rss>"
+    )
+    найдено = sources.extract(sources.PAPER, поток)
+    assert len(найдено) == 1 and найдено[0].whole
+    assert найдено[0].body == "Сотрудники пришли утром."
+
+    деловой = (
+        '<rss xmlns:yandex="http://news.yandex.ru"><channel>'
+        "<item><title>Премии и тихое увольнение</title>"
+        "<link>https://www.dp.ru/a/2026/09/25/rossijanam</link>"
+        "<yandex:full-text>Работодатели могут лишить премии.</yandex:full-text>"
+        "</item></channel></rss>"
+    )
+    строки = sources.extract(sources.DP, деловой)
+    assert строки[0].whole, "ДП отдаёт текст в теге для Яндекса"
+    assert "лишить премии" in строки[0].body
+
+
+def test_ленты_без_текста_дают_адрес_и_заголовок() -> None:
+    """Интерфакс и РИА текста в ленте не дают — за ним идёт разбор страницы."""
+    поток = (
+        "<rss><channel><item><title>Денежная база выросла</title>"
+        "<link>https://www.interfax.ru/business/1118437</link>"
+        "<description>Объём составил 22837,4 млрд рублей.</description>"
+        "<pubDate>Fri, 25 Sep 2026 11:05:00 +0300</pubDate>"
+        "</item></channel></rss>"
+    )
+    найдено = sources.extract(sources.INTERFAX, поток)
+    assert найдено[0].url == "https://www.interfax.ru/business/1118437"
+    assert not найдено[0].whole and "22837,4" in найдено[0].lead
+
+
+def test_пометка_издания_живёт_в_источнике() -> None:
+    """Статус иноагента — свойство издания, а не шаблона сообщения [NEWS-005]."""
+    assert sources.PAPER.notice and sources.MEDUZA.notice
+    assert not sources.FONTANKA.notice
+
+
+def test_разбор_страницы_без_абзацев() -> None:
+    """РИА верстает молнии блоками, а не тегом <p>; скрипты в текст не идут."""
+    from news import article
+
+    страница = (
+        '<html><head><meta property="og:title" content="Памфилова о выборах">'
+        '<script type="application/ld+json">{"@type":"ImageObject"}</script></head>'
+        '<body><div class="article__block"><div class="article__text">'
+        "ЕДГ-2026 стал одной из самых сложных кампаний в новой истории страны."
+        "</div></div></body></html>"
+    )
+    разбор = article.parse(страница)
+    assert разбор.title == "Памфилова о выборах"
+    assert "самых сложных кампаний" in разбор.body
+    assert "ImageObject" not in разбор.body, "разметка для поисковиков — не текст"
