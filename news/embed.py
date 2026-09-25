@@ -32,7 +32,7 @@ from . import model, store
 
 log = logging.getLogger("fpnews.embed")
 
-DEFAULT_MODEL = "text-embedding-004"
+DEFAULT_MODEL = "mistral/mistral-embed"
 # Заголовок плюс начало текста: конец материала у разных изданий свой.
 MAX_CHARS = 1200
 
