@@ -12,7 +12,8 @@ def conn(tmp_path):
     connection.close()
 
 
-def добавить(conn, source, url, title, lead="", body="", published="", listed="2026-09-25T10:00:00+00:00"):
+def добавить(conn, source, url, title, lead="", body="", published="",
+             listed="2026-09-25T10:00:00+00:00"):
     item_id, _ = store.remember(conn, source, url, title, listed, published)
     if lead or body:
         store.fill(conn, item_id, lead, body, listed)
@@ -65,29 +66,43 @@ def test_только_оригиналы_и_только_с_правками(con
 
 
 def test_чужой_ввод_не_ломает_поиск(conn):
+    """Спецсимволы FTS5 — текст, а не синтаксис: запрос не должен падать."""
     добавить(conn, "meduza", "https://m/2", "Суд и прокуратура")
-    assert search.search(conn, '"суд" OR *') ≠ None if False else True
-    assert search.search(conn, 'суд" NEAR/2 *')
+    assert [р["url"] for р in search.search(conn, 'суд"')] == ["https://m/2"]
+    assert [р["url"] for р in search.search(conn, "суд*(")] == ["https://m/2"]
+    assert search.search(conn, 'NEAR/2 "неттакогослова"') == []
     assert search.search(conn, "   ") == []
     assert search.search(conn, "*") == []
 
 
 def test_потолок_строк_и_сдвиг(conn):
     for номер in range(5):
-        добавить(conn, "fontanka", "https://f/{}".format(номер), "Ремонт дороги {}".format(номер))
+        добавить(conn, "fontanka", "https://f/ремонт/{}".format(номер),
+                 "Ремонт дороги {}".format(номер))
     assert len(search.search(conn, "ремонт", limit=2)) == 2
     assert len(search.search(conn, "ремонт", limit=1000)) == 5
     assert len(search.search(conn, "ремонт", limit=2, offset=4)) == 1
 
 
 def test_сюжет_считает_отставание(conn):
-    первый = добавить(conn, "interfax", "https://i/2", "Аэропорт закрыт", published="2026-09-25T10:00:00+00:00")
-    второй = добавить(conn, "ria", "https://r/2", "Аэропорт закрыт до утра", published="2026-09-25T10:30:00+00:00")
+    первый = добавить(conn, "interfax", "https://i/2", "Аэропорт закрыт",
+                       published="2026-09-25T10:00:00+00:00")
+    второй = добавить(conn, "ria", "https://r/2", "Аэропорт закрыт до утра",
+                      published="2026-09-25T10:30:00+00:00")
     store.mark_dup(conn, второй, первый)
     сюжет = search.story(conn, второй)
     assert сюжет["первый"] == "interfax"
     assert сюжет["участники"][1]["отставание"] == 1800.0
     assert сюжет["участники"][1]["перепечатка"] is True
+
+
+def test_без_времени_публикации_отставание_по_обнаружению(conn):
+    первый = добавить(conn, "dp", "https://d/3", "Порт встал", listed="2026-09-25T09:00:00+00:00")
+    второй = добавить(conn, "paper", "https://p/3", "Порт встал утром", listed="2026-09-25T09:15:00+00:00")
+    store.mark_dup(conn, второй, первый)
+    сюжет = search.story(conn, первый)
+    assert сюжет["участники"][1]["по_обнаружению"] is True
+    assert сюжет["участники"][1]["отставание"] == 900.0
 
 
 def test_одиночный_материал_не_сюжет(conn):
