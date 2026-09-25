@@ -20,7 +20,7 @@ from typing import Any
 
 import diag
 
-from . import deliver, fetch, sources, store, telegram
+from . import article, dedup, deliver, fetch, sources, store, telegram
 
 log = logging.getLogger("fpnews")
 
@@ -48,7 +48,41 @@ def report(conn: Any, limit: int = 200) -> dict[str, Any]:
     return out
 
 
-async def dispatch(bot: Any, conn: Any, queue: "asyncio.Queue[int]", stop: Any, done: Any) -> int:
+async def handle(bot: Any, session: Any, conn: Any, item_id: int) -> int:
+    """Путь одной новости после сторожа.
+
+    Порядок здесь и есть главное решение проекта: сырое сообщение уходит по
+    заголовку, и только потом мы идём за текстом, склеиваем дубли и досылаем
+    тем, у кого тема нашлась в тексте [NEWS-003].
+    """
+    sent = await deliver.send_item(bot, conn, item_id)
+    row = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
+    if row is None or row["cold"]:
+        return sent
+    item = dict(row)
+    if not item.get("body"):
+        parsed = await article.load(session, str(item["url"]))
+        if not parsed.empty:
+            store.fill(conn, item_id, parsed.lead, parsed.body, store.now())
+            if parsed.published_at and not item.get("published_at"):
+                store.stamp(conn, item_id, "published_at", store.published(parsed.published_at))
+            item["body"] = parsed.body
+    store.set_fingerprint(conn, item_id, dedup.fingerprint(item.get("title") or "",
+                                                           item.get("body") or ""))
+    item = dict(conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone())
+    original = dedup.find(conn, item)
+    if original:
+        store.mark_dup(conn, item_id, original)
+        sent += await deliver.send_also(bot, conn, item_id, original)
+    # Текст приехал — тема могла найтись в нём, а не в заголовке.
+    added = await deliver.send_item(bot, conn, item_id)
+    if added or sent:
+        store.stamp(conn, item_id, "enriched_at", store.now())
+    return sent + added
+
+
+async def dispatch(bot: Any, conn: Any, queue: "asyncio.Queue[int]", stop: Any, done: Any,
+                   session: Any = None) -> int:
     """Контур рассылки: берёт новость из очереди и отдаёт подписчикам.
 
     Отдельная задача, а не часть сторожа: медленный Telegram не имеет права
@@ -63,7 +97,7 @@ async def dispatch(bot: Any, conn: Any, queue: "asyncio.Queue[int]", stop: Any, 
                 return sent
             continue
         try:
-            sent += await deliver.send_item(bot, conn, item_id)
+            sent += await handle(bot, session, conn, item_id)
         except Exception as exc:  # noqa: BLE001 — рассылка не роняет сбор [CORE-017]
             log.warning("рассылка новости %s сорвалась: %s", item_id, exc)
 
@@ -95,7 +129,9 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
             )
             for code in codes
         ]
-        sender = asyncio.create_task(dispatch(bot, conn, queue, stop, done), name="рассылка")
+        sender = asyncio.create_task(
+            dispatch(bot, conn, queue, stop, done, session), name="рассылка"
+        )
         talker = (
             asyncio.create_task(bot_module.serve(bot, conn, stop), name="бот")
             if bot.ready

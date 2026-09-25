@@ -39,7 +39,8 @@ SCHEMA = (
         fetched_at    TEXT,                   -- скачали и разобрали текст
         sent_at       TEXT,                   -- ушло сырое сообщение
         enriched_at   TEXT,                   -- ушло дополнение
-        cold          INTEGER NOT NULL DEFAULT 0  -- подобрано на холодном старте
+        cold          INTEGER NOT NULL DEFAULT 0, -- подобрано на холодном старте
+        dup_of        INTEGER                     -- id новости, о которой уже писали
     )
     """,
     "CREATE INDEX IF NOT EXISTS items_listed ON items(listed_at)",
@@ -151,6 +152,17 @@ def fill(conn: sqlite3.Connection, item_id: int, lead: str, body: str, fetched_a
     conn.commit()
 
 
+def mark_dup(conn: sqlite3.Connection, item_id: int, original_id: int) -> None:
+    """Пометить новость перепечаткой. Цепочки не строим: только на оригинал."""
+    conn.execute("UPDATE items SET dup_of = ? WHERE id = ?", (original_id, item_id))
+    conn.commit()
+
+
+def set_fingerprint(conn: sqlite3.Connection, item_id: int, mark: str) -> None:
+    conn.execute("UPDATE items SET simhash = ? WHERE id = ?", (mark, item_id))
+    conn.commit()
+
+
 def now() -> str:
     """Единый вид времени в базе: UTC по ISO, с точностью до микросекунд.
 
@@ -247,4 +259,4 @@ def _delta(first: Any, second: Any) -> float | None:
 
 
 __all__ = ("CACHE_KB", "DEFAULT_PATH", "SCHEMA", "STAMPS", "connect", "ensure", "fill",
-           "latency_of", "latency_rows", "now", "published", "remember", "stamp")
+           "latency_of", "latency_rows", "mark_dup", "now", "published", "remember", "set_fingerprint", "stamp")

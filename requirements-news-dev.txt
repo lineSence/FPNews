@@ -1,0 +1,3 @@
+-r requirements-news.txt
+pytest>=8
+pyflakes>=3

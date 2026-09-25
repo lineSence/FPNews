@@ -1,0 +1,26 @@
+[Unit]
+Description=FPNews — новости по темам в Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fpnews
+WorkingDirectory=/opt/fpnews
+EnvironmentFile=/opt/fpnews/.env
+ExecStart=/opt/fpnews/.venv/bin/python -m news.run
+Restart=always
+RestartSec=5
+# Сервер маленький: если процесс раздулся, лучше перезапуск, чем вытеснение
+# соседних сервисов в swap.
+MemoryMax=320M
+MemorySwapMax=128M
+# Жёсткость по мелочи: писать можно только в свою папку.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/fpnews/data
+
+[Install]
+WantedBy=multi-user.target

@@ -54,6 +54,52 @@ def message(item: dict[str, Any], hit: topics.Hit) -> str:
     )
 
 
+def also_message(item: dict[str, Any], original: dict[str, Any]) -> str:
+    """Второе сообщение по тому же событию: коротко и со ссылкой."""
+    source = LABEL.get(str(item.get("source")), str(item.get("source")))
+    return (
+        "<i>Тоже написали</i> — {source}\n"
+        "<b>{title}</b>\n{url}\n\n"
+        "Об этом же: {first}"
+    ).format(
+        source=source,
+        title=html.escape(str(item.get("title") or "")),
+        url=item.get("url"),
+        first=original.get("url"),
+    )
+
+
+async def send_also(bot: Any, conn: sqlite3.Connection, item_id: int, original_id: int) -> int:
+    """Перепечатка уходит только тем, кто уже получил оригинал.
+
+    Кто оригинал не получал (тема не сработала или он пришёл до подписки),
+    получает обычное сообщение: для него это не повтор, а новость.
+    """
+    row = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
+    first = conn.execute("SELECT * FROM items WHERE id = ?", (original_id,)).fetchone()
+    if row is None or first is None or row["cold"]:
+        return 0
+    item, original = dict(row), dict(first)
+    got = {
+        int(line["user_id"])
+        for line in conn.execute(
+            "SELECT user_id FROM deliveries WHERE item_id = ?", (original_id,)
+        ).fetchall()
+    }
+    sent = 0
+    for hit in topics.pick(subscribers(conn), item.get("title") or "", item.get("body") or "",
+                           str(item.get("source") or "")):
+        if hit.user_id not in got:
+            continue  # обычную отправку сделает send_item
+        if already(conn, item_id, hit.user_id, "тоже_написали"):
+            continue
+        if not await bot.send(hit.user_id, also_message(item, original), preview=False):
+            continue
+        record(conn, item_id, hit.user_id, hit.topic_id, "тоже_написали")
+        sent += 1
+    return sent
+
+
 async def send_item(bot: Any, conn: sqlite3.Connection, item_id: int) -> int:
     """Разослать одну новость всем, чьи темы сработали. Вернуть число отправок."""
     row = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
@@ -64,8 +110,12 @@ async def send_item(bot: Any, conn: sqlite3.Connection, item_id: int) -> int:
     item = dict(row)
     hits = topics.pick(subscribers(conn), item.get("title") or "", item.get("body") or "",
                        str(item.get("source") or ""))
+    knew = _already_knows(conn, item.get("dup_of"))
     sent = 0
     for hit in hits:
+        if hit.user_id in knew:
+            # Ему уже приходил оригинал: перепечатка уйдёт как «тоже написали».
+            continue
         if already(conn, item_id, hit.user_id, "сырое"):
             continue
         if not await bot.send(hit.user_id, message(item, hit)):
@@ -79,6 +129,15 @@ async def send_item(bot: Any, conn: sqlite3.Connection, item_id: int) -> int:
     if sent:
         log.info("разослано %s: %s", sent, str(item.get("title"))[:80])
     return sent
+
+
+def _already_knows(conn: sqlite3.Connection, original_id: Any) -> set[int]:
+    if not original_id:
+        return set()
+    rows = conn.execute(
+        "SELECT user_id FROM deliveries WHERE item_id = ?", (int(original_id),)
+    ).fetchall()
+    return {int(row["user_id"]) for row in rows}
 
 
 def already(conn: sqlite3.Connection, item_id: int, user_id: int, kind: str) -> bool:
@@ -101,4 +160,5 @@ def record(conn: sqlite3.Connection, item_id: int, user_id: int, topic_id: int, 
         pass
 
 
-__all__ = ("LABEL", "already", "message", "record", "send_item", "subscribers")
+__all__ = ("LABEL", "already", "also_message", "message", "record", "send_also",
+           "send_item", "subscribers")
