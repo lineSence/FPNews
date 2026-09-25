@@ -180,3 +180,39 @@ def test_несуществующая_форма_даёт_404(tmp_path: Path) ->
     conn = _db(tmp_path)
     token = web.new_session(conn, 7)
     assert _post(conn, "/выдумка", token, _mark(token)).status.startswith("404")
+
+
+def test_чужая_ссылка_не_даёт_пустой_400(tmp_path: Path) -> None:
+    """Сбой страницы — это 500 с объяснением, а не немой 400.
+
+    Раньше разбор запроса и отрисовка страницы стояли в одном `try`, и любая
+    ошибка внутри страницы возвращалась как «400 Bad Request» с пустым телом.
+    """
+    conn = _db(tmp_path)
+    token = web.new_session(conn, 7)
+    огромная = _get(conn, "/лента", token, "?стр=99999999999999999999")
+    assert огромная.status.startswith("200"), "номер страницы обрезается потолком"
+
+
+def test_тело_кусками_доезжает(tmp_path: Path) -> None:
+    """Caddy шлёт формы кусками: без разбора chunked метка не совпадала."""
+    import asyncio  # noqa: PLC0415
+
+    conn = _db(tmp_path)
+    token = web.new_session(conn, 7)
+    тело = "метка={}&запрос=тариф".format(web.csrf(token)).encode()
+
+    async def прочитать() -> str:
+        поток = asyncio.StreamReader()
+        поток.feed_data("{:x}\r\n".format(len(тело)).encode() + тело + b"\r\n0\r\n\r\n")
+        поток.feed_eof()
+        return await web.read_body(поток, "Transfer-Encoding: chunked")
+
+    assert asyncio.run(прочитать()) == тело.decode()
+
+
+def test_форма_без_метки_объясняет_причину(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    token = web.new_session(conn, 7)
+    ответ = _post(conn, "/запросы/добавить", token, "метка=старая&запрос=тариф")
+    assert ответ.status.startswith("400") and "сессия сменилась" in ответ.body
