@@ -77,8 +77,8 @@ def test_чужой_ввод_не_ломает_поиск(conn):
 
 def test_потолок_строк_и_сдвиг(conn):
     for номер in range(5):
-        добавить(conn, "fontanka", "https://f/ремонт/{}".format(номер),
-                 "Ремонт дороги {}".format(номер))
+        добавить(conn, "fontanka", "https://f/ремонт/" + str(номер),
+                 "Ремонт дороги " + str(номер))
     assert len(search.search(conn, "ремонт", limit=2)) == 2
     assert len(search.search(conn, "ремонт", limit=1000)) == 5
     assert len(search.search(conn, "ремонт", limit=2, offset=4)) == 1
