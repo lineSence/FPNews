@@ -11,6 +11,13 @@
 
 Команд управления источниками нет: список изданий общий и меняется в коде, а
 не пользователем. Что своё у каждого — темы и подписка `[NEWS-005]`.
+
+Бот закрыт. Незнакомому человеку он отвечает одной фразой и не заводит
+учётку: войти можно только по личному приглашению владельца, командой
+`/ключ <ключ>`. Почему ключ отправляют боту, а не открывают ссылкой:
+ссылка с секретом внутри оседает в истории браузера, в журнале прокси и в
+заголовке `Referer` — то есть в трёх местах, которых мы не видим `[CORE-016]`.
+Сообщение в переписке с ботом остаётся у двоих.
 """
 
 from __future__ import annotations
@@ -20,7 +27,7 @@ import logging
 import sqlite3
 from typing import Any
 
-from . import enrich, model
+from . import access, enrich, model
 from . import run as run_module
 from . import store, topics
 
@@ -34,18 +41,36 @@ HELP = (
     "<b>/задержка</b> — как быстро доходят новости\n"
     "<b>/сводка</b> — что я пропустил; «/сводка 09:00» — присылать каждый день\n"
     "<b>/вход</b> — ссылка в веб-интерфейс\n\n"
+    "Владельцу: <b>/пригласить</b> Имя — ключ для нового человека, "
+    "<b>/доступы</b> — кому он выдан.\n\n"
     "Тема ловит слова в любой форме: «дрон» найдёт «дроны» и «дронов». "
     "Фраза в кавычках ищется целиком.\n\n"
     "Под каждой новостью три кнопки — выжимка, цитата, оценка. "
     "Модель работает только по нажатию и только на текст этой новости."
 )
 
+# Один и тот же ответ незнакомому — и на «/старт», и на неподошедший ключ, и
+# на исчерпанные попытки. Разные ответы подсказывали бы перебирающему, что он
+# угадал наполовину.
+ЗАКРЫТО = (
+    "Это закрытая система наблюдения за новостями.\n\n"
+    "Есть ключ доступа — пришлите его одной строкой: <code>/ключ ВАШ_КЛЮЧ</code>\n"
+    "Ключа нет — попросите у того, кто дал вам этого бота.\n\n"
+    "Ваш номер для запроса доступа: <code>{}</code>"
+)
+ПРИНЯТО = (
+    "Ключ принят, доступ открыт (роль: {роль}).\n\n"
+    "Ключ погашен: второй раз по нему не войти. Начните с <b>/помощь</b>, "
+    "а веб-интерфейс откроет команда <b>/вход</b>."
+)
+
 
 def ensure_user(conn: sqlite3.Connection, user_id: int, name: str = "") -> None:
+    """Завести или обновить человека. Вызывается только после приглашения."""
     conn.execute(
-        "INSERT INTO users(id, name, created_at) VALUES(?,?,?) "
+        "INSERT INTO users(id, name, role, created_at) VALUES(?,?,?,?) "
         "ON CONFLICT(id) DO UPDATE SET name = excluded.name",
-        (user_id, name, store.now()),
+        (user_id, name, access.ЧИТАТЕЛЬ, store.now()),
     )
     conn.commit()
 
@@ -136,6 +161,55 @@ def digest_text(conn: sqlite3.Connection, user_id: int, tail: str = "") -> str:
     return digest.text(data, web.base_url())
 
 
+def принять_ключ(conn: sqlite3.Connection, user_id: int, name: str, tail: str) -> str:
+    """Разбор «/ключ …» от незнакомого человека.
+
+    Сам ключ в журнал не пишем ни в каком виде: строка из сообщения — это
+    действующий секрет, а журналы читают и копируют шире, чем базу [NEWS-006].
+    """
+    if not access.попытка(user_id):
+        log.warning("перебор ключа: %s исчерпал попытки", user_id)
+        return ЗАКРЫТО.format(user_id)
+    роль = access.принять(conn, (tail or "").strip(), user_id, name)
+    if not роль:
+        log.info("ключ не подошёл: %s", user_id)
+        return ЗАКРЫТО.format(user_id)
+    access.забыть_попытки(user_id)
+    log.info("доступ открыт: %s, роль %s", user_id, роль)
+    return ПРИНЯТО.format(роль=роль)
+
+
+def пригласить(conn: sqlite3.Connection, user_id: int, tail: str) -> str:
+    """«/пригласить Петя» — новый ключ. Только владельцу."""
+    if not access.владелец(conn, user_id):
+        return "Приглашения выдаёт только владелец."
+    ключ, номер = access.выдать(conn, (tail or "").strip())
+    return (
+        "Приглашение №{номер} на {дней} дней.\n"
+        "Передайте человеку эти две строки:\n\n"
+        "<code>{ключ}</code>\n"
+        "Отправьте боту: <code>/ключ {ключ}</code>\n\n"
+        "Ключ показан один раз — в базе лежит только его отпечаток. "
+        "Отозвать можно на странице «Доступы»."
+    ).format(номер=номер, дней=access.DEFAULT_DAYS, ключ=ключ)
+
+
+def доступы(conn: sqlite3.Connection, user_id: int) -> str:
+    """Короткий список приглашений в бот: чтобы проверить с телефона."""
+    if not access.владелец(conn, user_id):
+        return "Список доступов виден только владельцу."
+    строки = access.приглашения(conn)
+    if not строки:
+        return "Приглашений пока нет. <code>/пригласить Имя</code>"
+    return "\n".join(
+        "{}. {} — {}{}".format(
+            row["номер"], row["кому"] or "без пометки", row["состояние"],
+            " ({})".format(row["имя"]) if row["имя"] else "",
+        )
+        for row in строки[:20]
+    )
+
+
 def login_link(conn: sqlite3.Connection, user_id: int) -> str:
     """Одноразовая ссылка в веб. Пароля нет — значит нечему утечь."""
     from . import pages, web  # noqa: PLC0415 — импорт здесь разрывает круг
@@ -149,10 +223,23 @@ def answer(conn: sqlite3.Connection, user_id: int, name: str, text: str) -> str:
     body = (text or "").strip()
     command, _, tail = body.partition(" ")
     command = command.lower().lstrip("/").split("@")[0]
-    if command in ("старт", "start", "помощь", "help"):
-        ensure_user(conn, user_id, name)
-        return HELP
+    if not access.известен(conn, user_id):
+        # Владелец мог ещё не появиться в базе: первый раз его назначает
+        # переменная окружения, а не ключ — выдавать приглашение некому.
+        access.бутстрап(conn)
+    if not access.известен(conn, user_id):
+        if command in ("ключ", "key"):
+            return принять_ключ(conn, user_id, name, tail)
+        return ЗАКРЫТО.format(user_id)
     ensure_user(conn, user_id, name)
+    if command in ("старт", "start", "помощь", "help"):
+        return HELP
+    if command in ("ключ", "key"):
+        return "Доступ у вас уже есть. Ключ больше не нужен."
+    if command in ("пригласить", "invite"):
+        return пригласить(conn, user_id, tail)
+    if command in ("доступы", "access"):
+        return доступы(conn, user_id)
     if command in ("добавить", "add"):
         return add_topic(conn, user_id, tail)
     if command in ("темы", "topics"):
@@ -229,5 +316,6 @@ async def serve(bot: Any, conn: sqlite3.Connection, stop: Any, rounds: int = 0,
     return handled
 
 
-__all__ = ("HELP", "add_topic", "answer", "drop_topic", "ensure_user", "latency_text",
-           "list_topics", "login_link", "press", "serve")
+__all__ = ("HELP", "ЗАКРЫТО", "add_topic", "answer", "drop_topic", "ensure_user",
+           "latency_text", "list_topics", "login_link", "press", "serve",
+           "доступы", "пригласить", "принять_ключ")
