@@ -196,3 +196,32 @@ def test_перечитывание_замечает_правку_и_досыл�
     assert row["title"] == "Чиновник арестован судом" and row["checks"] == 1
     assert store.last_revision(conn, item)["title"] == "Чиновник арестован судом"
     assert recheck.due(conn) == []
+
+
+def test_похожие_по_смыслу_из_готовых_векторов(tmp_path: Path) -> None:
+    """Похожие считаются по тем векторам, что уже есть: сети здесь нет."""
+    from news import embed, story
+
+    conn = store.connect(tmp_path / "похожие.sqlite3")
+    номера = []
+    for индекс, (заголовок, вектор) in enumerate((
+        ("Мост закрыли на ремонт", [1.0, 0.0, 0.0]),
+        ("Мост закроют до мая", [0.98, 0.2, 0.0]),
+        ("Тариф на воду вырос", [0.0, 0.0, 1.0]),
+    )):
+        item_id, _ = store.remember(conn, "fontanka", "https://x/{}".format(индекс),
+                                    заголовок, store.now(), published_at=store.now())
+        store.save_vector(conn, item_id, embed.name(), embed.pack(вектор))
+        номера.append(item_id)
+    похожие = story.similar(conn, номера[0])
+    assert похожие and похожие[0]["id"] == номера[1]
+    assert похожие[0]["похожесть"] > похожие[-1]["похожесть"]
+
+
+def test_без_вектора_похожих_нет(tmp_path: Path) -> None:
+    """Пусто — значит мы не считали вектор, а не «похожих не бывает» [NEWS-001]."""
+    from news import story
+
+    conn = store.connect(tmp_path / "без-вектора.sqlite3")
+    item_id, _ = store.remember(conn, "fontanka", "https://x/1", "Мост", store.now())
+    assert story.similar(conn, item_id) == []
