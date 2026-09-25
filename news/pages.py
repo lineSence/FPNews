@@ -96,26 +96,44 @@ ins { background:var(--ins-bg); color:var(--ins-ink); text-decoration:none }
            color:var(--mut); border-top:1px solid var(--hair); padding-top:8px }
 label { font-size:13.5px }
 code, .ровно { font-family:ui-monospace, Menlo, Consolas, monospace; font-size:12.5px }
+.цифры { display:flex; flex-wrap:wrap; background:var(--panel); border:1px solid var(--line);
+         border-radius:7px; margin:12px 0 18px }
+.цифры div { flex:1 1 110px; padding:9px 14px; border-right:1px solid var(--hair) }
+.цифры div:last-child { border-right:0 }
+.цифры b { display:block; font:400 21px/1.25 Georgia, serif }
+.цифры span { font-size:10.5px; text-transform:uppercase; letter-spacing:.06em;
+              color:var(--mut) }
+.две { display:grid; grid-template-columns:1fr 330px; gap:0 26px; align-items:start }
+@media (max-width:1000px) { .две { grid-template-columns:1fr } }
+.искра { display:inline-flex; align-items:flex-end; gap:1px; height:20px;
+         vertical-align:-4px; margin-right:8px }
+.искра i { width:4px; min-height:1px; background:var(--bar); border-radius:1px }
+.искра i.жар { background:var(--acc) }
+.панель h3 { margin:0 0 6px; font-size:14px; font-weight:600 }
+.панель > :last-child { margin-bottom:0 }
 """
 
 # Разделы бокового меню: адрес, название, группа.
 MENU = (
     ("Наблюдение", (
-        ("/", "Темы"),
+        ("/", "Сводка"),
         ("/лента", "Общая лента"),
-        ("/новости", "Пришло вам"),
         ("/поиск", "Поиск по архиву"),
         ("/правки", "Правки и снятия"),
-        ("/сущности", "Кто и что"),
         ("/всплески", "Всплески"),
-        ("/задержки", "Задержки"),
-        ("/сводка", "Сводка"),
+        ("/сущности", "Кто и что"),
     )),
-    ("Настройка", (
-        ("/источники", "Источники"),
+    ("Отдача", (
+        ("/новости", "Пришло вам"),
+        ("/сводка", "Ежедневная сводка"),
         ("/телеграм", "Отдача в Telegram"),
         ("/запросы", "Сохранённые запросы"),
+    )),
+    ("Настройка", (
+        ("/темы", "Мои темы"),
+        ("/источники", "Источники"),
         ("/состояние", "Состояние"),
+        ("/задержки", "Задержки"),
     )),
 )
 
@@ -177,7 +195,266 @@ def oops(text: str, theme: str = "система") -> str:
         html.escape(text)), theme)
 
 
+def lived(first: Any, second: Any) -> str:
+    """Сколько материал провисел: от публикации до нашей отметки о снятии.
+
+    Отметка — время, когда снятие увидели мы, а не когда его сделали в
+    редакции: между ними наш интервал перечитывания [NEWS-001]. Поэтому
+    «прожило» — оценка сверху, и врать точностью до минуты в сутках незачем.
+    """
+    from datetime import datetime  # noqa: PLC0415 — нужен только здесь
+
+    try:
+        начало = datetime.fromisoformat(str(first or ""))
+        конец = datetime.fromisoformat(str(second or ""))
+    except (TypeError, ValueError):
+        return "—"
+    if (начало.tzinfo is None) != (конец.tzinfo is None):
+        начало, конец = начало.replace(tzinfo=None), конец.replace(tzinfo=None)
+    секунд = (конец - начало).total_seconds()
+    if секунд < 0:
+        return "—"
+    if секунд >= 48 * 3600:
+        return "{} сут".format(int(секунд // 86400))
+    return lag(секунд)
+
+
+def ago(value: Any) -> str:
+    """Как давно это было. Нет времени — прочерк, а не «только что» [NEWS-001]."""
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    try:
+        когда = datetime.fromisoformat(str(value or ""))
+    except (TypeError, ValueError):
+        return "—"
+    сейчас = datetime.now(когда.tzinfo or timezone.utc)
+    if когда.tzinfo is None:
+        сейчас = сейчас.replace(tzinfo=None)
+    секунд = (сейчас - когда).total_seconds()
+    return "{} назад".format(lag(секунд)) if секунд >= 0 else "—"
+
+
+def _summary_bar(conn: Any) -> str:
+    """Полоса цифр: сколько у нас всего и что случилось за сутки."""
+    свод = store.summary(conn)
+
+    def цифра(значение: Any, хвост: str = "") -> str:
+        # Неизвестное показываем прочерком: ноль — это тоже утверждение [NEWS-001].
+        return "—" if значение is None else "{}{}".format(значение, хвост)
+
+    ячейки = (
+        (цифра(свод["материалов"]), "материалов"),
+        ("+" + цифра(свод["за_сутки"]), "за сутки"),
+        (цифра(свод["правок"]), "правок постфактум"),
+        (цифра(свод["снято"]), "снято"),
+        (цифра(свод["медиана_минут"], " мин"), "медиана до нас"),
+        (цифра(свод["поиск_мс"], " мс"), "поиск по архиву"),
+        (цифра(store.memory_mb(), " МБ"), "память"),
+    )
+    return '<div class=цифры>{}</div>'.format("".join(
+        "<div><b>{}</b><span>{}</span></div>".format(html.escape(str(значение)),
+                                                     html.escape(подпись))
+        for значение, подпись in ячейки))
+
+
+def _change_cards(conn: Any, limit: int = 50) -> list[str]:
+    """Карточки правок и снятий — общие для главной и для страницы правок."""
+    from . import diff as diff_module  # noqa: PLC0415
+
+    карточки = []
+    for row in store.gone(conn, limit):
+        копии = store.snapshots(conn, int(row["id"]))
+        отпечаток = str(копии[-1]["sha256"])[:16] if копии else ""
+        опубликовано = row["published_at"] or row["listed_at"]
+        карточки.append(
+            '<div class=панель><div class=метка>'
+            '<span class=снято>снято с публикации</span> · {source} · ответ {code} · '
+            'замечено {when}</div>'
+            '<p><a href="/материал?id={id}">{title}</a></p>'
+            '<p class=тихо>Опубликовано {pub} · прожило {lived}{copy}</p></div>'.format(
+                source=label(row["source"]), code=int(row["gone_code"] or 0),
+                when=when(row["gone_at"]), id=int(row["id"]),
+                title=html.escape(str(row["title"] or "без заголовка")),
+                pub=when(опубликовано), lived=lived(опубликовано, row["gone_at"]),
+                copy=(' · копия <span class=ровно>{}</span>'.format(html.escape(отпечаток))
+                      if отпечаток else " · копии нет"),
+            )
+        )
+    правки = conn.execute(
+        "SELECT r.item_id, r.seen_at, r.title, r.text, i.source, i.title AS now_title, "
+        "i.body AS now_body FROM item_revisions r JOIN items i ON i.id = r.item_id "
+        "ORDER BY r.id DESC LIMIT ?",
+        (int(limit),),
+    ).fetchall()
+    видели: set[int] = set()
+    for rev in правки:
+        item_id = int(rev["item_id"])
+        if item_id in видели:
+            continue
+        видели.add(item_id)
+        было, стало = str(rev["title"] or ""), str(rev["now_title"] or "")
+        заголовок = (diff_module.markup(было, стало) if было and стало and было != стало
+                     else html.escape(стало or было or "без заголовка"))
+        старый_текст, новый_текст = str(rev["text"] or ""), str(rev["now_body"] or "")
+        цитата = _removed_quote(старый_текст, новый_текст)
+        карточки.append(
+            '<div class=панель><div class=метка>правка · {source} · {when}</div>'
+            '<p><a href="/материал?id={id}">{title}</a></p>{quote}</div>'.format(
+                source=label(rev["source"]), when=when(rev["seen_at"]), id=item_id,
+                title=заголовок,
+                quote=("<p class=тихо>{}</p>".format(html.escape(цитата)) if цитата else ""),
+            )
+        )
+    return карточки
+
+
+def _removed_quote(old: str, new: str, limit: int = 160) -> str:
+    """Что именно убрали: самый длинный вычеркнутый кусок плюс сухая сводка.
+
+    Показываем цитату, а не только «−12 слов»: убранная фраза и есть
+    содержание правки, а пересказ её подменять не должен [NEWS-007].
+    """
+    from . import diff as diff_module  # noqa: PLC0415
+
+    if not (old and new):
+        return ""
+    куски = [текст.strip() for вид, текст in diff_module.parts(old, new)
+             if вид == "убрано" and len(текст.strip()) > 20]
+    сводка = diff_module.phrase(old, new)
+    if not куски:
+        return сводка
+    самый = max(куски, key=len)
+    if len(самый) > limit:
+        самый = самый[:limit].rstrip() + "…"
+    return "убрали: «{}» · {}".format(самый, сводка)
+
+
+def _burst_block(conn: Any, limit: int = 5) -> str:
+    """Всплески со спарклайном: кого стали упоминать чаще обычного [NEWS-008]."""
+    строки = store.bursts(conn)[:limit]
+    if not строки:
+        return ("<h2>Всплески</h2><p class=тихо>Никто не выбился из своего обычного "
+                "фона. Это наблюдение, а не тишина в городе [NEWS-001].</p>")
+    куски = []
+    for row in строки:
+        дни = store.entity_days(conn, int(row["id"]), 14)
+        по_дням = {str(день["день"]): int(день["сколько"]) for день in дни}
+        потолок = max(по_дням.values() or [1])
+        подряд = sorted(по_дням.items())[-14:]
+        искра = "".join(
+            '<i style="height:{}px"{}></i>'.format(
+                max(1, round(20 * count / потолок)),
+                " class=жар" if index >= len(подряд) - 2 else "")
+            for index, (_, count) in enumerate(подряд)
+        )
+        куски.append(
+            '<div class=панель><div class=искра>{искра}</div>'
+            '<a href="/сущность?id={id}">{name}</a> '
+            '<span class=тихо>{kind} · {сейчас} за двое суток · {фон}</span></div>'.format(
+                искра=искра, id=int(row["id"]), name=html.escape(str(row["имя"])),
+                kind=html.escape(str(row["вид"])), сейчас=row["сейчас"],
+                фон=("раньше не встречался — фона нет [NEWS-001]" if row["новое"]
+                     else "фон {} в день · ×{}".format(row["фон"], row["во_сколько_раз"])))
+        )
+    return ("<h2>Всплески</h2>" + "".join(куски) +
+            '<p class=тихо><a href="/всплески">Все всплески</a> · полоска — упоминания '
+            "по дням за две недели.</p>")
+
+
+def _sources_panel(conn: Any) -> str:
+    """Правая панель: что опрашиваем и когда в последний раз что-то принесло."""
+    from . import sources as sources_module  # noqa: PLC0415
+
+    состояние = store.source_states(conn)
+    строки = []
+    for code in sorted(sources_module.BY_CODE):
+        текущее = состояние.get(code, {})
+        последний = conn.execute(
+            "SELECT COUNT(*) AS всего, MAX(listed_at) AS последний FROM items "
+            "WHERE source = ? AND listed_at >= datetime('now', '-1 day')",
+            (code,),
+        ).fetchone()
+        включён = bool(текущее.get("включён", True))
+        строки.append(
+            "<p>{dot} {name} <span class=тихо>{count} за сутки · {ago}</span></p>".format(
+                dot='<span style="color:var(--ok)">●</span>' if включён
+                    else '<span class=тихо>○</span>',
+                name=label(code), count=int(последний["всего"] or 0),
+                ago=html.escape(ago(последний["последний"])),
+            )
+        )
+    return ('<div class=панель><h3>Источники</h3>{}'
+            '<p class=тихо><a href="/источники">Настроить опрос</a></p></div>').format(
+        "".join(строки))
+
+
+def _telegram_panel(conn: Any, user_id: int) -> str:
+    """Правая панель: что уходит в бот и когда он молчит."""
+    виды = store.kinds_of(conn, user_id)
+    row = conn.execute(
+        "SELECT quiet_from, quiet_to FROM users WHERE id = ?", (int(user_id),)
+    ).fetchone()
+    тишина = "{} — {}".format(str(row["quiet_from"] if row else "") or "—",
+                              str(row["quiet_to"] if row else "") or "—")
+    return (
+        '<div class=панель><h3>Что уходит в Telegram</h3>'
+        "<p>{виды}</p><p class=тихо>тихие часы: {тишина}</p>"
+        '<p class=тихо><a href="/телеграм">Настроить отдачу</a></p></div>'
+    ).format(виды=html.escape(", ".join(sorted(виды)) or "ничего не выбрано"),
+             тишина=html.escape(тишина))
+
+
+def _queries_panel(conn: Any, user_id: int, mark: str) -> str:
+    """Правая панель: сохранённые запросы и быстрое добавление нового."""
+    saved = store.queries(conn, user_id)
+    список = "".join(
+        '<p><a href="/поиск?q={ссылка}">{title}</a> '
+        "<span class=тихо>{режим}</span></p>".format(
+            ссылка=urllib.parse.quote(str(query["query"])),
+            title=html.escape(str(query["title"] or query["query"])),
+            режим="в бот" if query["notify"] else "молча",
+        )
+        for query in saved[:6]
+    ) or "<p class=тихо>Ни одного сохранённого запроса.</p>"
+    форма = (
+        '<form class=строка method=post action="/запросы/добавить">'
+        '<input type=hidden name=метка value="{mark}">'
+        '<input type=hidden name=уведомлять value=1>'
+        '<input type=text name=запрос placeholder="тариф, подрядчик" size=16 required>'
+        "<button class=тихо>Сохранить</button></form>"
+    ).format(mark=mark)
+    return ('<div class=панель><h3>Сохранённые запросы</h3>{}{}'
+            '<p class=тихо><a href="/запросы">Все запросы</a></p></div>').format(
+        список, форма)
+
+
 def home(conn: Any, user_id: int, mark: str, theme: str = "система") -> str:
+    """Главная — сводка за сутки: что изменилось, кого стали упоминать, что уходит.
+
+    Первым экраном идут наблюдения, а не настройки: человек приходит узнать,
+    что происходило, и только потом что-то крутит. Цифры в полосе — про наш
+    архив и нашу задержку, а не про город [NEWS-008].
+    """
+    карточки = _change_cards(conn, 6)[:6]
+    левая = "<h2>Правки и исчезновения</h2>" + ("".join(карточки) if карточки else
+        "<p class=тихо>Ни правок, ни снятий мы пока не видели. Это не значит, "
+        "что их не было [NEWS-001].</p>")
+    левая += '<p class=тихо><a href="/правки">Весь журнал правок</a></p>'
+    левая += _burst_block(conn)
+    правая = (_sources_panel(conn) + _telegram_panel(conn, user_id) +
+              _queries_panel(conn, user_id, mark))
+    выход = ('<form method=post action="/выход">'
+             '<input type=hidden name=метка value="{}">'
+             "<button class=тихо>Выйти</button></form>").format(mark)
+    return page("Что происходило за сутки",
+                _summary_bar(conn) +
+                '<div class=две><div>{}</div><div>{}{}</div></div>'.format(
+                    левая, правая, выход),
+                theme, "/")
+
+
+def topics_page(conn: Any, user_id: int, mark: str, theme: str = "система") -> str:
+    """Мои темы: слова, по которым нам приносят материалы."""
     rows = conn.execute(
         "SELECT id, title, words FROM topics WHERE user_id = ? ORDER BY id", (user_id,)
     ).fetchall()
@@ -199,14 +476,10 @@ def home(conn: Any, user_id: int, mark: str, theme: str = "система") -> s
         '<input type=text name=слова placeholder="дроны, бпла, беспилотник" required>'
         "<button>Добавить</button></form>"
     ).format(mark)
-    exit_form = (
-        '<form method=post action="/выход">'
-        '<input type=hidden name=метка value="{}"><button>Выйти</button></form>'
-    ).format(mark)
     return page("Мои темы", listing + form +
                 "<p class=тихо>Слово ищется в любой форме: «дрон» найдёт «дроны» и "
-                "«дронов». Фраза в кавычках — целиком.</p>" + exit_form,
-                theme, "/")
+                "«дронов». Фраза в кавычках — целиком.</p>",
+                theme, "/темы")
 
 
 def feed(conn: Any, user_id: int, limit: int = 30, theme: str = "система") -> str:
@@ -636,44 +909,7 @@ def _copies_block(card: dict[str, Any]) -> str:
 
 def changes_page(conn: Any, theme: str = "система", limit: int = 50) -> str:
     """Журнал правок и снятий: что изменилось в городе за последние дни."""
-    from . import diff as diff_module  # noqa: PLC0415
-
-    снятые = store.gone(conn, limit)
-    строки = []
-    for row in снятые:
-        строки.append(
-            '<div class=панель><div class=метка><span class=снято>снято с публикации</span> · '
-            '{source} · ответ {code} · замечено {when}</div>'
-            '<p><a href="/материал?id={id}">{title}</a></p>'
-            '<p class=тихо>Опубликовано {pub}. Копия страницы сохранена.</p></div>'.format(
-                source=label(row["source"]), code=int(row["gone_code"] or 0),
-                when=when(row["gone_at"]), id=int(row["id"]),
-                title=html.escape(str(row["title"] or "без заголовка")),
-                pub=when(row["published_at"] or row["listed_at"]),
-            )
-        )
-    правки = conn.execute(
-        "SELECT r.item_id, r.seen_at, r.title, r.text, i.source, i.title AS now_title "
-        "FROM item_revisions r JOIN items i ON i.id = r.item_id "
-        "ORDER BY r.id DESC LIMIT ?",
-        (int(limit),),
-    ).fetchall()
-    seen: set[int] = set()
-    for rev in правки:
-        item_id = int(rev["item_id"])
-        if item_id in seen:
-            continue
-        seen.add(item_id)
-        было = str(rev["title"] or "")
-        стало = str(rev["now_title"] or "")
-        head = "правка · {} · {}".format(label(rev["source"]), when(rev["seen_at"]))
-        title = (diff_module.markup(было, стало) if было and стало and было != стало
-                 else html.escape(стало or было or "без заголовка"))
-        строки.append(
-            '<div class=панель><div class=метка>{head}</div>'
-            '<p><a href="/материал?id={id}">{title}</a></p></div>'.format(
-                head=head, id=item_id, title=title)
-        )
+    строки = _change_cards(conn, limit)
     if not строки:
         строки = ["<p class=тихо>Ни правок, ни снятий мы пока не видели. "
                   "Это не значит, что их не было [NEWS-001].</p>"]
