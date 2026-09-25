@@ -224,6 +224,19 @@ def route(conn: Any, request: Request) -> Response:
         return Response(pages.latency(conn))
     if request.path == "/новости":
         return Response(pages.feed(conn, user_id))
+    if request.path == "/поиск":
+        return Response(pages.search_page(conn, request.query))
+    if request.path == "/материал":
+        card = pages.item_page(conn, request.query.get("id", ""))
+        if card is None:
+            return Response(pages.oops("Такого материала нет."), status="404 Not Found")
+        return Response(card)
+    if request.path == "/сюжет":
+        plot = pages.story_page(conn, request.query.get("id", ""))
+        if plot is None:
+            return Response(pages.oops("Сюжета нет: других изданий мы не видели."),
+                            status="404 Not Found")
+        return Response(plot)
     return Response(pages.oops("Такой страницы нет."), status="404 Not Found")
 
 
