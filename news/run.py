@@ -20,8 +20,8 @@ from typing import Any
 
 import diag
 
-from . import (article, dedup, deliver, entities, fetch, model, queries, recheck, sources,
-               store, story, telegram, web)
+from . import (article, dedup, deliver, digest, entities, fetch, model, queries, recheck,
+               sources, store, story, telegram, web)
 
 log = logging.getLogger("fpnews")
 
@@ -167,6 +167,7 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
         asker = asyncio.create_task(
             queries.loop(bot, conn, stop), name="сохранённые-запросы"
         )
+        digester = asyncio.create_task(digest.loop(bot, conn, stop), name="сводки")
         try:
             await asyncio.gather(*watchers)
         except asyncio.CancelledError:  # pragma: no cover — снаружи
@@ -176,6 +177,7 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
         stop.set()
         changes = await keeper
         found = await asker
+        digests = await digester
         site.cancel()
         if talker is not None:
             stop.set()
@@ -184,6 +186,7 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
     summary["разослано"] = sent
     summary["досылок_об_изменениях"] = changes
     summary["по_сохранённым_запросам"] = found
+    summary["сводок"] = digests
     summary["вызовов_модели"] = budget.calls
     if budget.embeds:
         summary["векторов"] = budget.embeds
