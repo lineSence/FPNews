@@ -883,6 +883,73 @@ def source_health(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return out
 
 
+def summary(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Цифры для полосы на главной. Каждая — про наши наблюдения [NEWS-001].
+
+    «Правок постфактум» и «снято» считаются за сутки: это события, а не
+    запасы. «Материалов» — всё, что у нас есть, потому что архив тем и
+    ценен. Медиана, а не среднее: одна залипшая новость портит среднее и
+    создаёт ложное впечатление о типичном случае [CORE-019].
+    """
+    import statistics  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    строка = conn.execute(
+        "SELECT (SELECT COUNT(*) FROM items) AS всего, "
+        "(SELECT COUNT(*) FROM items WHERE COALESCE(published_at, listed_at) >= "
+        "datetime('now', '-1 day')) AS за_сутки, "
+        "(SELECT COUNT(DISTINCT item_id) FROM item_revisions WHERE seen_at >= "
+        "datetime('now', '-1 day')) AS правок, "
+        "(SELECT COUNT(*) FROM items WHERE gone_at >= datetime('now', '-1 day')) AS снято"
+    ).fetchone()
+    задержки = [row["редакционная"] for row in latency_rows(conn, 200)
+                if row["редакционная"] is not None]
+    начало = time.perf_counter()
+    try:
+        conn.execute("SELECT rowid FROM items_fts WHERE items_fts MATCH ? LIMIT 10",
+                     ('"мост"',)).fetchall()
+        поиск = round((time.perf_counter() - начало) * 1000, 2)
+    except sqlite3.Error:
+        поиск = None  # индекса ещё нет — это не ноль миллисекунд [NEWS-001]
+    return {
+        "материалов": int(строка["всего"] or 0),
+        "за_сутки": int(строка["за_сутки"] or 0),
+        "правок": int(строка["правок"] or 0),
+        "снято": int(строка["снято"] or 0),
+        "медиана_минут": round(statistics.median(задержки) / 60, 1) if задержки else None,
+        "поиск_мс": поиск,
+        "индекс_кб": index_size(conn),
+    }
+
+
+def index_size(conn: sqlite3.Connection) -> float | None:
+    """Размер поискового индекса в килобайтах. `None` — посчитать нечем.
+
+    `dbstat` есть не в каждой сборке SQLite, и врать оценкой мы не будем:
+    неизвестное значение показывается прочерком, а не нулём [NEWS-001].
+    """
+    try:
+        row = conn.execute(
+            "SELECT SUM(pgsize) AS байт FROM dbstat WHERE name LIKE 'items_fts%'"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    байт = int((row["байт"] if row else 0) or 0)
+    return round(байт / 1024, 1) if байт else None
+
+
+def memory_mb() -> float | None:
+    """Сколько памяти занимает наш процесс. `None` — система не сказала."""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as файл:
+            for line in файл:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024, 1)
+    except OSError:
+        return None
+    return None
+
+
 def mark_checked(conn: sqlite3.Connection, item_id: int) -> None:
     conn.execute(
         "UPDATE items SET checked_at = ?, checks = checks + 1 WHERE id = ?",
@@ -899,4 +966,4 @@ __all__ = ("CACHE_KB", "DEFAULT_PATH", "KINDS", "LATE_COLUMNS", "SCHEMA", "STAMP
            "source_enabled", "source_every", "source_states", "kinds_of", "stamp",
            "set_topic_delivery", "set_user_sources", "source_allowed", "topics_of",
            "toggle_notify", "user_sources", "vector_of", "bursts", "entities_top", "entity",
-           "entity_days", "entity_items", "mark_digest", "set_digest", "sizes", "source_health")
+           "entity_days", "entity_items", "mark_digest", "set_digest", "sizes", "source_health", "summary", "index_size", "memory_mb")
