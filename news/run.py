@@ -20,8 +20,8 @@ from typing import Any
 
 import diag
 
-from . import (article, dedup, deliver, fetch, model, queries, recheck, sources, store,
-               story, telegram, web)
+from . import (article, dedup, deliver, entities, fetch, model, queries, recheck, sources,
+               store, story, telegram, web)
 
 log = logging.getLogger("fpnews")
 
@@ -75,6 +75,9 @@ async def handle(bot: Any, session: Any, conn: Any, item_id: int,
             item["body"] = parsed.body
     store.set_fingerprint(conn, item_id, dedup.fingerprint(item.get("title") or "",
                                                            item.get("body") or ""))
+    # Сущности — правила и микросекунды, поэтому считаются прямо здесь, а не
+    # в контуре обогащения: ждать модели ради регулярок незачем [NEWS-002].
+    entities.save(conn, item_id, item.get("title") or "", item.get("body") or "")
     item = dict(conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone())
     original = dedup.find(conn, item)
     if not original and sent and budget is not None:
