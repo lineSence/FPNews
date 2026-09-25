@@ -192,6 +192,8 @@ LATE_COLUMNS = (
     ("items", "gone_code", "INTEGER"),
     # Какие виды сообщений человек согласен получать. Пусто — все.
     ("users", "kinds", "TEXT NOT NULL DEFAULT ''"),
+    # Из каких изданий человек согласен получать сообщения. Пусто — из всех.
+    ("users", "sources", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -651,6 +653,58 @@ def set_quiet(conn: sqlite3.Connection, user_id: int, since: str, until: str) ->
     conn.commit()
 
 
+def user_sources(conn: sqlite3.Connection, user_id: int) -> set[str]:
+    """Из каких изданий человек получает сообщения. Пустая настройка — из всех.
+
+    Пусто значит «все», а не «ни одного»: у старых записей колонки не было, и
+    трактовать её отсутствие как запрет означало бы молча выключить рассылку
+    [NEWS-001].
+    """
+    row = conn.execute("SELECT sources FROM users WHERE id = ?", (int(user_id),)).fetchone()
+    raw = str(row["sources"] or "") if row is not None else ""
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def set_user_sources(conn: sqlite3.Connection, user_id: int, codes: Any) -> None:
+    """Сохраняет список изданий для отдачи. Все отмечены — храним пусто."""
+    chosen = [str(code).strip() for code in (codes or []) if str(code).strip()]
+    conn.execute("UPDATE users SET sources = ? WHERE id = ?",
+                 (",".join(sorted(set(chosen))), int(user_id)))
+    conn.commit()
+
+
+def source_allowed(conn: sqlite3.Connection, user_id: int, code: str) -> bool:
+    """Согласен ли человек получать сообщения из этого издания."""
+    chosen = user_sources(conn, user_id)
+    return not chosen or str(code) in chosen
+
+
+def topics_of(conn: sqlite3.Connection, user_id: int) -> list[dict[str, Any]]:
+    """Темы человека вместе с настройками отдачи."""
+    rows = conn.execute(
+        "SELECT * FROM topics WHERE user_id = ? ORDER BY id", (int(user_id),)
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def set_topic_delivery(conn: sqlite3.Connection, topic_id: int, user_id: int, *,
+                       enabled: bool, sources: Any = None) -> bool:
+    """Отдавать ли тему в бот и из каких изданий. Чужую тему не трогает."""
+    codes = None
+    if sources is not None:
+        codes = ",".join(sorted({str(code).strip() for code in sources if str(code).strip()}))
+    if codes is None:
+        cursor = conn.execute("UPDATE topics SET enabled = ? WHERE id = ? AND user_id = ?",
+                              (1 if enabled else 0, int(topic_id), int(user_id)))
+    else:
+        cursor = conn.execute(
+            "UPDATE topics SET enabled = ?, sources = ? WHERE id = ? AND user_id = ?",
+            (1 if enabled else 0, codes, int(topic_id), int(user_id)),
+        )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
 def mark_checked(conn: sqlite3.Connection, item_id: int) -> None:
     conn.execute(
         "UPDATE items SET checked_at = ?, checks = checks + 1 WHERE id = ?",
@@ -665,4 +719,5 @@ __all__ = ("CACHE_KB", "DEFAULT_PATH", "KINDS", "LATE_COLUMNS", "SCHEMA", "STAMP
            "revise", "revisions", "revive", "save_enrichment", "save_snapshot", "save_vector",
            "set_fingerprint", "set_kinds", "set_quiet", "set_source", "snapshot_page", "snapshots",
            "source_enabled", "source_every", "source_states", "kinds_of", "stamp",
-           "toggle_notify", "vector_of")
+           "set_topic_delivery", "set_user_sources", "source_allowed", "topics_of",
+           "toggle_notify", "user_sources", "vector_of")
