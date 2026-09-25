@@ -101,6 +101,8 @@ async def send_also(bot: Any, conn: sqlite3.Connection, item_id: int, original_i
         if already(conn, item_id, hit.user_id, "тоже_написали") or not wants(
                 conn, hit.user_id, "тоже_написали"):
             continue
+        if not allowed(conn, hit.user_id, item.get("source")):
+            continue
         if not await bot.send(hit.user_id, also_message(item, original), preview=False,
                               keyboard=enrich.keyboard(item_id)):
             continue
@@ -138,6 +140,16 @@ def wants(conn: sqlite3.Connection, user_id: int, kind: str) -> bool:
     return kind in store.kinds_of(conn, user_id)
 
 
+def allowed(conn: sqlite3.Connection, user_id: int, source: Any) -> bool:
+    """Разрешено ли издание в отдаче этого человека.
+
+    Проверка стоит рядом с отправкой, а не в отборе тем: тема может ловить
+    нужные слова где угодно, а получать человек хочет не из всех изданий.
+    Пустой список изданий означает «из всех» [NEWS-001].
+    """
+    return store.source_allowed(conn, user_id, str(source or ""))
+
+
 async def send_to(bot: Any, conn: sqlite3.Connection, item_id: int, user_id: int,
                   text: str, kind: str = "запрос") -> int:
     """Отправка одному человеку по его сохранённому запросу.
@@ -147,6 +159,9 @@ async def send_to(bot: Any, conn: sqlite3.Connection, item_id: int, user_id: int
     прислал бы человеку то же самое второй раз [NEWS-004].
     """
     if not item_id or already(conn, item_id, user_id, kind) or not wants(conn, user_id, kind):
+        return 0
+    row = conn.execute("SELECT source FROM items WHERE id = ?", (int(item_id),)).fetchone()
+    if row is not None and not allowed(conn, user_id, row["source"]):
         return 0
     if not await bot.send(user_id, text, preview=False, keyboard=enrich.keyboard(item_id)):
         return 0
@@ -171,6 +186,8 @@ async def send_item(bot: Any, conn: sqlite3.Connection, item_id: int) -> int:
             # Ему уже приходил оригинал: перепечатка уйдёт как «тоже написали».
             continue
         if already(conn, item_id, hit.user_id, "сырое") or not wants(conn, hit.user_id, "сырое"):
+            continue
+        if not allowed(conn, hit.user_id, item.get("source")):
             continue
         if not await bot.send(hit.user_id, message(item, hit),
                               keyboard=enrich.keyboard(item_id)):
@@ -215,5 +232,5 @@ def record(conn: sqlite3.Connection, item_id: int, user_id: int, topic_id: int, 
         pass
 
 
-__all__ = ("LABEL", "NOTICE", "already", "also_message", "message", "record", "send_also",
+__all__ = ("LABEL", "NOTICE", "allowed", "already", "also_message", "message", "record", "send_also",
            "send_change", "send_item", "send_to", "subscribers", "wants")
