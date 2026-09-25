@@ -155,3 +155,112 @@ def test_сервер_отвечает_по_настоящему(tmp_path: Path,
 
 def test_разметка_не_течёт() -> None:
     assert "&lt;b&gt;" in pages.oops("<b>опасно</b>")
+
+
+# --- шаг 9: поиск, карточка материала, сюжет ---------------------------
+
+
+def test_поиск_без_запроса_ничего_не_ищет(tmp_path: Path) -> None:
+    """«Показать всё» на одном ядре стоит дороже, чем пользы [CORE-025]."""
+    conn = _db(tmp_path)
+    token = web.new_session(conn, 7)
+    store.remember(conn, "fontanka", "https://f/10", "Мост развели", store.now())
+    body = _get(conn, "/поиск", token).body
+    assert "Введите слово" in body
+    assert "Мост развели" not in body
+
+
+def test_поиск_ведёт_на_карточку_и_на_оригинал(tmp_path: Path) -> None:
+    """Ссылка на источник обязательна в любой выдаче [NEWS-007]."""
+    conn = _db(tmp_path)
+    token = web.new_session(conn, 7)
+    item, _ = store.remember(conn, "fontanka", "https://fontanka.ru/мост",
+                             "Мост развели раньше срока", store.now())
+    body = _get(conn, "/поиск", token, "?q=мост").body
+    assert "Мост развели раньше срока" in body
+    assert "https://fontanka.ru/мост" in body
+    assert "/материал?id=" + str(item) in body
+
+
+def test_пустая_выдача_не_доказательство(tmp_path: Path) -> None:
+    """Отсутствие записи — не отсутствие события [NEWS-001]."""
+    conn = _db(tmp_path)
+    token = web.new_session(conn, 7)
+    body = _get(conn, "/поиск", token, "?q=неттакогослова").body
+    assert "Ничего не найдено" in body
+    assert "не значит, что события не было" in body
+
+
+def test_в_выдаче_чужой_заголовок_экранируется(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    token = web.new_session(conn, 7)
+    store.remember(conn, "dp", "https://d/9", "<script>бюджет</script>", store.now())
+    body = _get(conn, "/поиск", token, "?q=бюджет").body
+    assert "<script>бюджет" not in body and "&lt;script&gt;" in body
+
+
+def test_поиск_постранично(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    token = web.new_session(conn, 7)
+    for номер in range(pages.PER_PAGE + 1):
+        store.remember(conn, "fontanka", "https://f/ремонт/" + str(номер),
+                       "Ремонт дороги " + str(номер), store.now())
+    первая = _get(conn, "/поиск", token, "?q=ремонт").body
+    assert первая.count("/материал?id=") == pages.PER_PAGE
+    assert "дальше" in первая and "назад" not in первая
+    вторая = _get(conn, "/поиск", token, "?q=ремонт&стр=2").body
+    assert вторая.count("/материал?id=") == 1
+    assert "назад" in вторая and "дальше" not in вторая
+
+
+def test_карточка_не_перепечатывает_чужой_текст(tmp_path: Path) -> None:
+    """Лид и ссылка — да, полное тело чужой статьи — нет [NEWS-007]."""
+    conn = _db(tmp_path)
+    token = web.new_session(conn, 7)
+    item, _ = store.remember(conn, "moika78", "https://k/9", "Снег в сентябре", store.now())
+    store.fill(conn, item, "Короткий лид", "ПОЛНЫЙ ЧУЖОЙ ТЕКСТ статьи", store.now())
+    response = _get(conn, "/материал", token, "?id=" + str(item))
+    assert response.status.startswith("200")
+    assert "Снег в сентябре" in response.body
+    assert "Короткий лид" in response.body
+    assert "https://k/9" in response.body
+    assert "ПОЛНЫЙ ЧУЖОЙ ТЕКСТ" not in response.body
+
+
+def test_несуществующий_материал_даёт_404(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    token = web.new_session(conn, 7)
+    assert _get(conn, "/материал", token, "?id=10000").status.startswith("404")
+    assert _get(conn, "/материал", token, "?id=абв").status.startswith("404")
+    assert _get(conn, "/материал", token).status.startswith("404")
+
+
+def test_сюжет_показывает_кто_первый_и_отставание(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    token = web.new_session(conn, 7)
+    первый, _ = store.remember(conn, "interfax", "https://i/9", "Аэропорт закрыт",
+                                "2026-09-25T10:00:00+00:00", "2026-09-25T10:00:00+00:00")
+    второй, _ = store.remember(conn, "ria", "https://r/9", "Аэропорт закрыт до утра",
+                                "2026-09-25T10:30:00+00:00", "2026-09-25T10:30:00+00:00")
+    store.mark_dup(conn, второй, первый)
+    response = _get(conn, "/сюжет", token, "?id=" + str(второй))
+    assert response.status.startswith("200")
+    assert "Первым опубликовало" in response.body
+    assert "30 мин" in response.body
+    assert "https://r/9" in response.body
+
+
+def test_одиночный_материал_сюжета_не_даёт(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    token = web.new_session(conn, 7)
+    один, _ = store.remember(conn, "paper", "https://p/9", "Выставка открылась", store.now())
+    response = _get(conn, "/сюжет", token, "?id=" + str(один))
+    assert response.status.startswith("404")
+    assert "других изданий" in response.body
+
+
+def test_поиск_и_карточка_требуют_входа(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    assert _get(conn, "/поиск", query="?q=мост").status.startswith("401")
+    assert _get(conn, "/материал", query="?id=1").status.startswith("401")
+    assert _get(conn, "/сюжет", query="?id=1").status.startswith("401")
