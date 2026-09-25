@@ -102,6 +102,8 @@ class Response:
     kind: str = "text/html; charset=utf-8"
     cookie: str = ""
     location: str = ""
+    # Имя файла для выгрузки. Пусто — обычная страница.
+    filename: str = ""
 
     def raw(self) -> bytes:
         data = self.body.encode("utf-8")
@@ -117,6 +119,12 @@ class Response:
             head.append("Location: {}".format(self.location))
         if self.cookie:
             head.append("Set-Cookie: {}".format(self.cookie))
+        if self.filename:
+            # Имя в кавычках и в UTF-8: без этого браузер сохранит «лента»
+            # набором вопросительных знаков.
+            head.append('Content-Disposition: attachment; filename="{}"; '
+                        "filename*=UTF-8''{}".format(
+                            "export", urllib.parse.quote(self.filename)))
         return ("\r\n".join(head) + "\r\n\r\n").encode("utf-8") + data
 
 
@@ -242,7 +250,7 @@ def csrf(token: str) -> str:
 
 # Разделы, куда возвращаемся после формы: список закрыт, чтобы адрес из
 # формы не превратился в редирект куда попало.
-_SECTIONS = ("/запросы", "/источники", "/телеграм", "/темы")
+_SECTIONS = ("/запросы", "/источники", "/сводка", "/телеграм", "/темы")
 
 
 def _number(raw: Any) -> int:
@@ -306,6 +314,8 @@ def route(conn: Any, request: Request) -> Response:
         elif request.path == "/телеграм/сохранить":
             store.set_kinds(conn, user_id, request.all_of("вид"))
             store.set_quiet(conn, user_id, request.form.get("с", ""), request.form.get("по", ""))
+        elif request.path == "/сводка/время":
+            store.set_digest(conn, user_id, request.form.get("время", ""))
         elif request.path == "/телеграм/издания":
             store.set_user_sources(conn, user_id, request.all_of("издание"))
         elif request.path == "/телеграм/тема":
@@ -330,6 +340,16 @@ def route(conn: Any, request: Request) -> Response:
         return Response(pages.feed(conn, user_id, theme=theme))
     if request.path == "/поиск":
         return Response(pages.search_page(conn, request.query, theme))
+    if request.path == "/выгрузка":
+        from . import export  # noqa: PLC0415 — нужен только здесь
+
+        вид = request.query.get("формат", "csv")
+        тело, тип, имя = export.make(conn, request.query, вид, request.all_asked)
+        return Response(тело, kind=тип, filename=имя)
+    if request.path == "/состояние":
+        return Response(pages.state_page(conn, theme))
+    if request.path == "/сводка":
+        return Response(pages.digest_page(conn, user_id, csrf(token), theme))
     if request.path == "/сущности":
         return Response(pages.entities_page(conn, request.query, theme))
     if request.path == "/всплески":
