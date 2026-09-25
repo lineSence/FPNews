@@ -131,6 +131,22 @@ async def send_change(bot: Any, conn: sqlite3.Connection, item_id: int, text: st
     return sent
 
 
+async def send_to(bot: Any, conn: sqlite3.Connection, item_id: int, user_id: int,
+                  text: str, kind: str = "запрос") -> int:
+    """Отправка одному человеку по его сохранённому запросу.
+
+    Тем же путём, что и всё остальное: та же защита от повторов в
+    `deliveries`, тот же вид отправки в журнале. Иначе перезапуск процесса
+    прислал бы человеку то же самое второй раз [NEWS-004].
+    """
+    if not item_id or already(conn, item_id, user_id, kind):
+        return 0
+    if not await bot.send(user_id, text, preview=False, keyboard=enrich.keyboard(item_id)):
+        return 0
+    record(conn, item_id, user_id, None, kind)
+    return 1
+
+
 async def send_item(bot: Any, conn: sqlite3.Connection, item_id: int) -> int:
     """Разослать одну новость всем, чьи темы сработали. Вернуть число отправок."""
     row = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
@@ -193,4 +209,4 @@ def record(conn: sqlite3.Connection, item_id: int, user_id: int, topic_id: int, 
 
 
 __all__ = ("LABEL", "NOTICE", "already", "also_message", "message", "record", "send_also",
-           "send_change", "send_item", "subscribers")
+           "send_change", "send_item", "send_to", "subscribers")
