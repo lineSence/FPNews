@@ -152,6 +152,26 @@ SCHEMA = (
     """,
     "CREATE INDEX IF NOT EXISTS saved_queries_user ON saved_queries(user_id)",
     """
+    CREATE TABLE IF NOT EXISTS entities (
+        id         INTEGER PRIMARY KEY,
+        kind       TEXT NOT NULL,              -- организация | человек | деньги | место
+        name       TEXT NOT NULL,              -- как встретилось в первый раз
+        norm       TEXT NOT NULL,              -- ключ склейки написаний
+        created_at TEXT NOT NULL,
+        UNIQUE(kind, norm)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS mentions (
+        item_id   INTEGER NOT NULL,
+        entity_id INTEGER NOT NULL,
+        in_title  INTEGER NOT NULL DEFAULT 0,  -- в заголовке вес другой
+        times     INTEGER NOT NULL DEFAULT 1,
+        UNIQUE(item_id, entity_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS mentions_entity ON mentions(entity_id)",
+    """
     CREATE TABLE IF NOT EXISTS enrichments (
         item_id    INTEGER NOT NULL,
         kind       TEXT NOT NULL,              -- выжимка | цитата | оценка
@@ -705,6 +725,97 @@ def set_topic_delivery(conn: sqlite3.Connection, topic_id: int, user_id: int, *,
     return cursor.rowcount > 0
 
 
+def entities_top(conn: sqlite3.Connection, *, kind: str = "", query: str = "",
+                 days: int = 30, limit: int = 100) -> list[dict[str, Any]]:
+    """Кого чаще всего упоминают за окно. Пустой список — мы не видели."""
+    where = ["m.item_id = i.id"]
+    params: list[Any] = []
+    if kind:
+        where.append("e.kind = ?")
+        params.append(kind)
+    if query:
+        where.append("e.norm LIKE ?")
+        params.append("%{}%".format(str(query).lower().replace("ё", "е")))
+    if days:
+        where.append("COALESCE(i.published_at, i.listed_at) >= datetime('now', ?)")
+        params.append("-{} days".format(int(days)))
+    rows = conn.execute(
+        "SELECT e.id, e.kind, e.name, COUNT(DISTINCT i.id) AS материалов, "
+        "SUM(m.in_title) AS в_заголовках, MAX(COALESCE(i.published_at, i.listed_at)) AS последний "
+        "FROM entities e JOIN mentions m ON m.entity_id = e.id JOIN items i "
+        "WHERE {} GROUP BY e.id ORDER BY материалов DESC, последний DESC LIMIT ?".format(
+            " AND ".join(where)),
+        (*params, max(1, min(int(limit), 500))),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def entity(conn: sqlite3.Connection, entity_id: int) -> dict[str, Any] | None:
+    row = conn.execute("SELECT * FROM entities WHERE id = ?", (int(entity_id),)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def entity_items(conn: sqlite3.Connection, entity_id: int,
+                 limit: int = 50) -> list[dict[str, Any]]:
+    """Материалы, где сущность встретилась. Свежие сверху, со ссылкой."""
+    rows = conn.execute(
+        "SELECT i.id, i.title, i.url, i.source, i.published_at, i.listed_at, i.gone_at, "
+        "m.in_title, m.times FROM mentions m JOIN items i ON i.id = m.item_id "
+        "WHERE m.entity_id = ? ORDER BY COALESCE(i.published_at, i.listed_at) DESC LIMIT ?",
+        (int(entity_id), max(1, min(int(limit), 200))),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def entity_days(conn: sqlite3.Connection, entity_id: int, days: int = 30) -> list[dict[str, Any]]:
+    """Упоминания по дням — для полоски всплеска на карточке."""
+    rows = conn.execute(
+        "SELECT date(COALESCE(i.published_at, i.listed_at)) AS день, COUNT(*) AS сколько "
+        "FROM mentions m JOIN items i ON i.id = m.item_id WHERE m.entity_id = ? "
+        "AND COALESCE(i.published_at, i.listed_at) >= datetime('now', ?) "
+        "GROUP BY день ORDER BY день",
+        (int(entity_id), "-{} days".format(int(days))),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def bursts(conn: sqlite3.Connection, *, window: int = 2, background: int = 30,
+           limit: int = 30) -> list[dict[str, Any]]:
+    """Всплески: о ком вдруг стали писать чаще обычного.
+
+    Считаем просто: упоминания за короткое окно против среднесуточного фона
+    за месяц. Это наблюдение, а не объяснение: всплеск говорит «стали писать»,
+    а не «что-то случилось» [NEWS-008]. Сущности, которых до этого не было
+    вовсе, фоном не считаются нулём — у них фон неизвестен [NEWS-001], и они
+    помечаются отдельно.
+    """
+    rows = conn.execute(
+        "SELECT e.id, e.kind, e.name, "
+        "SUM(CASE WHEN COALESCE(i.published_at, i.listed_at) >= datetime('now', ?) "
+        "THEN 1 ELSE 0 END) AS сейчас, COUNT(*) AS всего "
+        "FROM entities e JOIN mentions m ON m.entity_id = e.id "
+        "JOIN items i ON i.id = m.item_id "
+        "WHERE COALESCE(i.published_at, i.listed_at) >= datetime('now', ?) "
+        "GROUP BY e.id HAVING сейчас >= 2 ORDER BY сейчас DESC LIMIT ?",
+        ("-{} days".format(int(window)), "-{} days".format(int(background)),
+         max(1, min(int(limit), 100))),
+    ).fetchall()
+    out = []
+    for row in rows:
+        сейчас = int(row["сейчас"])
+        всего = int(row["всего"])
+        фон = (всего - сейчас) / max(1, background - window)
+        out.append({
+            "id": int(row["id"]), "вид": row["kind"], "имя": row["name"],
+            "сейчас": сейчас, "за_месяц": всего,
+            "фон": round(фон, 2),
+            "во_сколько_раз": round(сейчас / window / фон, 1) if фон > 0 else None,
+            "новое": фон == 0,
+        })
+    out.sort(key=lambda item: (item["во_сколько_раз"] or 999, item["сейчас"]), reverse=True)
+    return out
+
+
 def mark_checked(conn: sqlite3.Connection, item_id: int) -> None:
     conn.execute(
         "UPDATE items SET checked_at = ?, checks = checks + 1 WHERE id = ?",
@@ -720,4 +831,5 @@ __all__ = ("CACHE_KB", "DEFAULT_PATH", "KINDS", "LATE_COLUMNS", "SCHEMA", "STAMP
            "set_fingerprint", "set_kinds", "set_quiet", "set_source", "snapshot_page", "snapshots",
            "source_enabled", "source_every", "source_states", "kinds_of", "stamp",
            "set_topic_delivery", "set_user_sources", "source_allowed", "topics_of",
-           "toggle_notify", "user_sources", "vector_of")
+           "toggle_notify", "user_sources", "vector_of", "bursts", "entities_top", "entity",
+           "entity_days", "entity_items")
