@@ -44,22 +44,24 @@ def collect(conn: Any, user_id: int, hours: int = DEFAULT_HOURS) -> dict[str, An
     """Что произошло за окно с точки зрения одного человека."""
     окно = hours_back(hours)
     всего = conn.execute(
-        "SELECT COUNT(*) AS n FROM items WHERE COALESCE(published_at, listed_at) >= "
-        "datetime('now', ?)", (окно,),
+        "SELECT COUNT(*) AS n FROM items WHERE "
+        "julianday(COALESCE(published_at, listed_at)) >= julianday('now', ?)", (окно,),
     ).fetchone()["n"]
     свои = conn.execute(
         "SELECT i.id, i.title, i.url, i.source, d.kind FROM deliveries d "
-        "JOIN items i ON i.id = d.item_id WHERE d.user_id = ? AND d.sent_at >= "
-        "datetime('now', ?) AND d.kind IN ('сырое', 'запрос') ORDER BY d.id DESC LIMIT ?",
+        "JOIN items i ON i.id = d.item_id WHERE d.user_id = ? AND "
+        "julianday(d.sent_at) >= julianday('now', ?) AND d.kind IN ('сырое', 'запрос') ORDER BY d.id DESC LIMIT ?",
         (int(user_id), окно, LINES),
     ).fetchall()
     правки = conn.execute(
         "SELECT i.id, i.title, r.seen_at FROM item_revisions r JOIN items i ON i.id = r.item_id "
-        "WHERE r.seen_at >= datetime('now', ?) GROUP BY i.id ORDER BY r.seen_at DESC LIMIT ?",
+        "WHERE julianday(r.seen_at) >= julianday('now', ?) GROUP BY i.id "
+        "ORDER BY r.seen_at DESC LIMIT ?",
         (окно, LINES),
     ).fetchall()
     снятия = conn.execute(
-        "SELECT id, title, gone_code FROM items WHERE gone_at >= datetime('now', ?) "
+        "SELECT id, title, gone_code FROM items WHERE gone_at IS NOT NULL "
+        "AND julianday(gone_at) >= julianday('now', ?) "
         "ORDER BY gone_at DESC LIMIT ?", (окно, LINES),
     ).fetchall()
     return {
