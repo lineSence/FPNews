@@ -217,6 +217,10 @@ LATE_COLUMNS = (
     # Сводка: во сколько слать («09:00») и за какой день уже отправлена.
     ("users", "digest_at", "TEXT NOT NULL DEFAULT ''"),
     ("users", "digest_on", "TEXT NOT NULL DEFAULT ''"),
+    # Шаг 14: задержка отдачи в минутах (0 — слать сразу) и адресат: пусто —
+    # личка, иначе номер канала или группы.
+    ("users", "delay", "INTEGER NOT NULL DEFAULT 0"),
+    ("users", "target", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -425,7 +429,7 @@ def neighbours(conn: sqlite3.Connection, item_id: int, model: str,
         "SELECT i.id, i.title, i.url, i.source, v.vec FROM items i "
         "JOIN vectors v ON v.item_id = i.id AND v.model = ? "
         "WHERE i.id != ? AND i.dup_of IS NULL AND i.cold = 0 "
-        "AND i.listed_at >= datetime('now', ?) ORDER BY i.id DESC LIMIT ?",
+        "AND julianday(i.listed_at) >= julianday('now', ?) ORDER BY i.id DESC LIMIT ?",
         (model, item_id, "-{} hours".format(int(hours)), int(limit)),
     ).fetchall()
     return [dict(row) for row in rows]
@@ -660,6 +664,55 @@ def set_kinds(conn: sqlite3.Connection, user_id: int, kinds: Any) -> None:
     conn.commit()
 
 
+def delay_of(conn: sqlite3.Connection, user_id: int) -> int:
+    """Задержка отдачи в минутах. Ноль — слать сразу.
+
+    Зачем она есть. Первые минуты после выхода материал часто правят: меняют
+    заголовок, дописывают абзац. Кому-то важнее увидеть первым, кому-то —
+    увидеть устоявшееся. Это выбор человека, а не наше решение за него.
+    """
+    row = conn.execute("SELECT delay FROM users WHERE id = ?", (int(user_id),)).fetchone()
+    return int((row["delay"] if row else 0) or 0)
+
+
+def set_delay(conn: sqlite3.Connection, user_id: int, minutes: Any) -> int:
+    """Сохранить задержку. Мусор и отрицательное — это ноль, а не ошибка."""
+    try:
+        значение = max(0, min(int(str(minutes).strip() or 0), 24 * 60))
+    except ValueError:
+        значение = 0
+    conn.execute("UPDATE users SET delay = ? WHERE id = ?", (значение, int(user_id)))
+    conn.commit()
+    return значение
+
+
+def target_of(conn: sqlite3.Connection, user_id: int) -> int:
+    """Куда слать: личка человека или указанный канал.
+
+    Пустое поле — личка, и это не «канал не задан, значит никуда» [NEWS-001].
+    Номер `users.id` совпадает с номером чата в личке, канал задаётся числом
+    вида `-1001234567890`.
+    """
+    row = conn.execute("SELECT target FROM users WHERE id = ?", (int(user_id),)).fetchone()
+    куда = str((row["target"] if row else "") or "").strip()
+    try:
+        return int(куда) if куда else int(user_id)
+    except ValueError:
+        return int(user_id)
+
+
+def set_target(conn: sqlite3.Connection, user_id: int, chat: Any) -> str:
+    """Сохранить адресата. Не число — считаем, что человек выбрал личку."""
+    текст = str(chat or "").strip()
+    try:
+        значение = str(int(текст)) if текст else ""
+    except ValueError:
+        значение = ""
+    conn.execute("UPDATE users SET target = ? WHERE id = ?", (значение, int(user_id)))
+    conn.commit()
+    return значение
+
+
 def set_quiet(conn: sqlite3.Connection, user_id: int, since: str, until: str) -> None:
     """Тихие часы. Непонятное время не сохраняется, а не ломает настройку."""
     import re  # noqa: PLC0415
@@ -740,7 +793,8 @@ def entities_top(conn: sqlite3.Connection, *, kind: str = "", query: str = "",
         where.append("e.norm LIKE ?")
         params.append("%{}%".format(str(query).lower().replace("ё", "е")))
     if days:
-        where.append("COALESCE(i.published_at, i.listed_at) >= datetime('now', ?)")
+        where.append("julianday(COALESCE(i.published_at, i.listed_at)) "
+                     ">= julianday('now', ?)")
         params.append("-{} days".format(int(days)))
     rows = conn.execute(
         "SELECT e.id, e.kind, e.name, COUNT(DISTINCT i.id) AS материалов, "
@@ -775,48 +829,89 @@ def entity_days(conn: sqlite3.Connection, entity_id: int, days: int = 30) -> lis
     rows = conn.execute(
         "SELECT date(COALESCE(i.published_at, i.listed_at)) AS день, COUNT(*) AS сколько "
         "FROM mentions m JOIN items i ON i.id = m.item_id WHERE m.entity_id = ? "
-        "AND COALESCE(i.published_at, i.listed_at) >= datetime('now', ?) "
+        "AND julianday(COALESCE(i.published_at, i.listed_at)) >= julianday('now', ?) "
         "GROUP BY день ORDER BY день",
         (int(entity_id), "-{} days".format(int(days))),
     ).fetchall()
     return [dict(row) for row in rows]
 
 
-def bursts(conn: sqlite3.Connection, *, window: int = 2, background: int = 30,
-           limit: int = 30) -> list[dict[str, Any]]:
-    """Всплески: о ком вдруг стали писать чаще обычного.
+def bursts(conn: sqlite3.Connection, *, window: int = 1, background: int = 28,
+           limit: int = 30, порог: float = 3.0) -> list[dict[str, Any]]:
+    """Всплески: о ком стали писать заметно чаще своей же нормы.
 
-    Считаем просто: упоминания за короткое окно против среднесуточного фона
-    за месяц. Это наблюдение, а не объяснение: всплеск говорит «стали писать»,
-    а не «что-то случилось» [NEWS-008]. Сущности, которых до этого не было
-    вовсе, фоном не считаются нулём — у них фон неизвестен [NEWS-001], и они
-    помечаются отдельно.
+    Норма считается медианой дневных упоминаний за четыре недели, а разброс —
+    медианой отклонений от неё (MAD). Среднее здесь не работает: один
+    громкий день задирает среднее так, что следующий такой же день уже не
+    выглядит всплеском, и мы его пропустим [CORE-019]. Медиана и MAD одну
+    выброшенную точку переживают спокойно.
+
+    Дни без упоминаний считаются нулями сознательно: для сущности, которая
+    уже есть в архиве, «в этот день о ней не писали» — это измеренный ноль,
+    а не отсутствие данных. А вот для сущности, которой в фоновом окне не
+    было вовсе, фона нет: она помечается «новое», и число «во сколько раз»
+    для неё не выдумывается [NEWS-001].
+
+    Порог — сколько разбросов должно быть от нормы. Три MAD это примерно
+    «так бывает реже чем раз в месяц». Если разброс нулевой (обычно о ком-то
+    пишут ровно ноль или ровно раз), берём минимальный шаг в единицу, иначе
+    любое второе упоминание считалось бы бесконечным всплеском.
+
+    Всплеск — это наблюдение «стали писать чаще», а не объяснение «что-то
+    случилось»: объяснение остаётся за человеком [NEWS-008].
     """
-    rows = conn.execute(
+    import statistics  # noqa: PLC0415
+
+    окно = max(1, int(window))
+    фон_дней = max(окно + 1, int(background))
+    строки = conn.execute(
         "SELECT e.id, e.kind, e.name, "
-        "SUM(CASE WHEN COALESCE(i.published_at, i.listed_at) >= datetime('now', ?) "
-        "THEN 1 ELSE 0 END) AS сейчас, COUNT(*) AS всего "
+        "date(COALESCE(i.published_at, i.listed_at)) AS день, "
+        "COUNT(*) AS сколько, COUNT(DISTINCT i.source) AS изданий, "
+        "MAX(CASE WHEN julianday(COALESCE(i.published_at, i.listed_at)) "
+        ">= julianday('now', ?) THEN 1 ELSE 0 END) AS свежий "
         "FROM entities e JOIN mentions m ON m.entity_id = e.id "
         "JOIN items i ON i.id = m.item_id "
-        "WHERE COALESCE(i.published_at, i.listed_at) >= datetime('now', ?) "
-        "GROUP BY e.id HAVING сейчас >= 2 ORDER BY сейчас DESC LIMIT ?",
-        ("-{} days".format(int(window)), "-{} days".format(int(background)),
-         max(1, min(int(limit), 100))),
+        "WHERE julianday(COALESCE(i.published_at, i.listed_at)) >= julianday('now', ?) "
+        "GROUP BY e.id, день",
+        ("-{} days".format(окно), "-{} days".format(фон_дней)),
     ).fetchall()
-    out = []
-    for row in rows:
-        сейчас = int(row["сейчас"])
-        всего = int(row["всего"])
-        фон = (всего - сейчас) / max(1, background - window)
-        out.append({
-            "id": int(row["id"]), "вид": row["kind"], "имя": row["name"],
-            "сейчас": сейчас, "за_месяц": всего,
-            "фон": round(фон, 2),
-            "во_сколько_раз": round(сейчас / window / фон, 1) if фон > 0 else None,
-            "новое": фон == 0,
+    собрано: dict[int, dict[str, Any]] = {}
+    for строка in строки:
+        запись = собрано.setdefault(int(строка["id"]), {
+            "вид": строка["kind"], "имя": строка["name"],
+            "дни": [], "сейчас": 0, "изданий": 0,
         })
-    out.sort(key=lambda item: (item["во_сколько_раз"] or 999, item["сейчас"]), reverse=True)
-    return out
+        if строка["свежий"]:
+            запись["сейчас"] += int(строка["сколько"])
+            запись["изданий"] = max(запись["изданий"], int(строка["изданий"]))
+        else:
+            запись["дни"].append(int(строка["сколько"]))
+    итог = []
+    for номер, запись in собрано.items():
+        сейчас = int(запись["сейчас"])
+        if сейчас < 2:
+            continue
+        # Дни без единого упоминания — это измеренные нули, и они входят в
+        # норму. Без них медиана считалась бы только по «громким» дням.
+        дни = запись["дни"] + [0] * max(0, фон_дней - окно - len(запись["дни"]))
+        новое = not запись["дни"]
+        норма = statistics.median(дни) if дни else 0.0
+        разброс = statistics.median([abs(день - норма) for день in дни]) if дни else 0.0
+        шаг = max(разброс * 1.4826, 1.0)
+        отклонение = (сейчас - норма) / шаг
+        if not новое and отклонение < порог:
+            continue
+        итог.append({
+            "id": номер, "вид": запись["вид"], "имя": запись["имя"],
+            "сейчас": сейчас, "изданий": int(запись["изданий"]),
+            "норма": round(float(норма), 1), "разброс": round(float(разброс), 1),
+            "отклонение": round(float(отклонение), 1),
+            "во_сколько_раз": round(сейчас / норма, 1) if норма > 0 else None,
+            "дней_в_фоне": len(дни), "новое": новое, "окно_дней": окно,
+        })
+    итог.sort(key=lambda запись: (запись["отклонение"], запись["сейчас"]), reverse=True)
+    return итог[:max(1, min(int(limit), 100))]
 
 
 def set_digest(conn: sqlite3.Connection, user_id: int, when: str) -> None:
@@ -832,6 +927,90 @@ def mark_digest(conn: sqlite3.Connection, user_id: int, day: str) -> None:
     """Отметить, что за этот день сводка ушла. Защита от повторной отправки."""
     conn.execute("UPDATE users SET digest_on = ? WHERE id = ?", (str(day), int(user_id)))
     conn.commit()
+
+
+def archive_span(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Глубина архива: с какого дня и по какой у нас есть материалы."""
+    row = conn.execute(
+        "SELECT MIN(COALESCE(published_at, listed_at)) AS первый, "
+        "MAX(COALESCE(published_at, listed_at)) AS последний, COUNT(*) AS всего FROM items"
+    ).fetchone()
+    копии = conn.execute(
+        "SELECT COUNT(*) AS штук, MIN(taken_at) AS первая FROM snapshots"
+    ).fetchone()
+    return {
+        "первый": row["первый"], "последний": row["последний"],
+        "всего": int(row["всего"] or 0),
+        "копий": int(копии["штук"] or 0), "первая_копия": копии["первая"],
+    }
+
+
+def drop_old_snapshots(conn: sqlite3.Connection, days: Any) -> int:
+    """Выбросить копии страниц старше N дней. Возвращает, сколько удалено.
+
+    Копия — это доказательство того, что текст был именно таким [NEWS-007],
+    поэтому чистка только по прямой просьбе человека и только по возрасту.
+    Мусорный или нулевой срок ничего не удаляет: «удалить всё» не должно
+    получаться случайно [CORE-017].
+    """
+    try:
+        срок = int(str(days).strip())
+    except (TypeError, ValueError):
+        return 0
+    if срок <= 0:
+        return 0
+    курсор = conn.execute(
+        "DELETE FROM snapshots WHERE julianday(taken_at) < julianday('now', ?)",
+        ("-{} days".format(срок),),
+    )
+    conn.commit()
+    return int(курсор.rowcount or 0)
+
+
+def compact(conn: sqlite3.Connection) -> float:
+    """Сжать файл базы (VACUUM). Возвращает, сколько килобайт освободилось.
+
+    Удаление строк не уменьшает файл: SQLite оставляет страницы себе. После
+    чистки копий это заметно, поэтому кнопка есть. Операция блокирующая, но
+    редкая и запускается руками [CORE-025].
+    """
+    было = conn.execute("PRAGMA page_count").fetchone()[0] * conn.execute(
+        "PRAGMA page_size").fetchone()[0]
+    conn.execute("VACUUM")
+    стало = conn.execute("PRAGMA page_count").fetchone()[0] * conn.execute(
+        "PRAGMA page_size").fetchone()[0]
+    return round((int(было) - int(стало)) / 1024, 1)
+
+
+def measurements(conn: sqlite3.Connection, limit: int = 500) -> list[dict[str, Any]]:
+    """Замеры по изданиям: медианы задержек, на которых видно чужую работу.
+
+    Медиана, а не среднее: один залипший материал не должен решать за всех
+    [CORE-019]. Нет ни одного замера — в ответе `None`, а не ноль [NEWS-001].
+    """
+    import statistics  # noqa: PLC0415
+
+    собрано: dict[str, dict[str, list[float]]] = {}
+    for row in latency_rows(conn, limit):
+        запись = собрано.setdefault(
+            str(row["площадка"]), {"редакционная": [], "до_отправки": [], "до_полного": []})
+        for поле in ("редакционная", "до_отправки", "до_полного"):
+            if row.get(поле) is not None:
+                запись[поле].append(float(row[поле]))
+
+    def медиана(значения: list[float], делитель: float = 1.0) -> float | None:
+        return round(statistics.median(значения) / делитель, 1) if значения else None
+
+    итог = []
+    for код, значения in sorted(собрано.items()):
+        итог.append({
+            "код": код,
+            "замеров": len(значения["редакционная"]),
+            "редакционная_мин": медиана(значения["редакционная"], 60.0),
+            "до_отправки_сек": медиана(значения["до_отправки"]),
+            "до_полного_сек": медиана(значения["до_полного"]),
+        })
+    return итог
 
 
 def sizes(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -869,7 +1048,8 @@ def source_health(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         "(julianday('now') - julianday(MAX(listed_at))) * 24 AS часов_назад, "
         "(julianday(MAX(listed_at)) - julianday(MIN(listed_at))) * 24 / "
         "MAX(1, COUNT(*) - 1) AS обычно_часов FROM items "
-        "WHERE listed_at >= datetime('now', '-30 days') GROUP BY source ORDER BY source"
+        "WHERE julianday(listed_at) >= julianday('now', '-30 days') "
+        "GROUP BY source ORDER BY source"
     ).fetchall()
     out = []
     for row in rows:
@@ -896,11 +1076,13 @@ def summary(conn: sqlite3.Connection) -> dict[str, Any]:
 
     строка = conn.execute(
         "SELECT (SELECT COUNT(*) FROM items) AS всего, "
-        "(SELECT COUNT(*) FROM items WHERE COALESCE(published_at, listed_at) >= "
-        "datetime('now', '-1 day')) AS за_сутки, "
-        "(SELECT COUNT(DISTINCT item_id) FROM item_revisions WHERE seen_at >= "
-        "datetime('now', '-1 day')) AS правок, "
-        "(SELECT COUNT(*) FROM items WHERE gone_at >= datetime('now', '-1 day')) AS снято"
+        "(SELECT COUNT(*) FROM items WHERE "
+        "julianday(COALESCE(published_at, listed_at)) >= julianday('now', '-1 day')) "
+        "AS за_сутки, "
+        "(SELECT COUNT(DISTINCT item_id) FROM item_revisions WHERE "
+        "julianday(seen_at) >= julianday('now', '-1 day')) AS правок, "
+        "(SELECT COUNT(*) FROM items WHERE gone_at IS NOT NULL AND "
+        "julianday(gone_at) >= julianday('now', '-1 day')) AS снято"
     ).fetchone()
     задержки = [row["редакционная"] for row in latency_rows(conn, 200)
                 if row["редакционная"] is not None]
@@ -966,4 +1148,7 @@ __all__ = ("CACHE_KB", "DEFAULT_PATH", "KINDS", "LATE_COLUMNS", "SCHEMA", "STAMP
            "source_enabled", "source_every", "source_states", "kinds_of", "stamp",
            "set_topic_delivery", "set_user_sources", "source_allowed", "topics_of",
            "toggle_notify", "user_sources", "vector_of", "bursts", "entities_top", "entity",
-           "entity_days", "entity_items", "mark_digest", "set_digest", "sizes", "source_health", "summary", "index_size", "memory_mb")
+           "entity_days", "entity_items", "mark_digest", "set_digest", "sizes",
+           "source_health", "summary", "index_size", "memory_mb", "delay_of", "set_delay",
+           "target_of", "set_target", "archive_span", "drop_old_snapshots", "compact",
+           "measurements")
