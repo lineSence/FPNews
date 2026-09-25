@@ -82,6 +82,13 @@ th { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(-
 del { background:var(--del-bg); color:var(--del-ink) }
 ins { background:var(--ins-bg); color:var(--ins-ink); text-decoration:none }
 .снято { color:var(--bad); font-weight:600 }
+.виды a { display:inline-block; padding:3px 10px; margin:0 6px 6px 0; font-size:13px;
+          border:1px solid var(--line); border-radius:14px; text-decoration:none;
+          color:var(--ink); background:var(--panel) }
+.виды a.выбран { background:var(--acc); color:#fff; border-color:var(--acc) }
+.полоска { display:flex; align-items:flex-end; gap:2px; height:40px; margin:10px 0;
+           padding:0 2px; border-bottom:1px solid var(--line) }
+.полоска .день { width:10px; background:var(--acc); border-radius:2px 2px 0 0 }
 .метка { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--mut) }
 .строка-полей { display:flex; gap:.5rem; flex-wrap:wrap; align-items:center;
                 margin-bottom:.5rem }
@@ -99,6 +106,8 @@ MENU = (
         ("/новости", "Пришло вам"),
         ("/поиск", "Поиск по архиву"),
         ("/правки", "Правки и снятия"),
+        ("/сущности", "Кто и что"),
+        ("/всплески", "Всплески"),
         ("/задержки", "Задержки"),
     )),
     ("Настройка", (
@@ -817,6 +826,119 @@ def queries_page(conn: Any, user_id: int, mark: str, theme: str = "систем�
                 theme, "/запросы")
 
 
+def entities_page(conn: Any, query: dict[str, str], theme: str = "система") -> str:
+    """Кто и что упоминается: люди, организации, места, суммы."""
+    from . import entities as entities_module  # noqa: PLC0415
+
+    вид = str(query.get("вид", "") or "")
+    вид = вид if вид in entities_module.KINDS else ""
+    слово = str(query.get("q", "") or "").strip()
+    try:
+        дней = max(1, min(365, int(str(query.get("дней", "30") or "30"))))
+    except ValueError:
+        дней = 30
+    строки = store.entities_top(conn, kind=вид, query=слово, days=дней)
+    кнопки = " ".join(
+        '<a href="/сущности?вид={code}&дней={дней}"{here}>{name}</a>'.format(
+            code=urllib.parse.quote(name), дней=дней,
+            here=" class=выбран" if name == вид else "", name=html.escape(name))
+        for name in ("",) + entities_module.KINDS
+    ).replace('вид=&', 'вид=&').replace('>​<', '><')
+    форма = (
+        '<form class=строка method=get action="/сущности">'
+        '<input type=text name=q value="{q}" placeholder="часть имени">'
+        '<input type=hidden name=вид value="{вид}">'
+        '<input type=number name=дней value="{дней}" min=1 max=365 size=4>'
+        "<button>Найти</button></form>"
+    ).format(q=html.escape(слово, quote=True), вид=html.escape(вид, quote=True), дней=дней)
+    if not строки:
+        тело = ("<p class=тихо>Ничего не нашлось. Пустая таблица означает, что правила "
+                "извлечения этого не увидели, а не что таких упоминаний не было "
+                "[NEWS-001].</p>")
+    else:
+        тело = ("<table><tr><th>кто или что</th><th>вид</th><th>материалов</th>"
+                "<th>в заголовках</th><th>последний раз</th></tr>{}</table>").format(
+            "".join(
+                '<tr><td><a href="/сущность?id={id}">{name}</a></td><td class=тихо>{kind}</td>'
+                "<td>{count}</td><td>{titles}</td><td>{last}</td></tr>".format(
+                    id=int(row["id"]), name=html.escape(str(row["name"])),
+                    kind=html.escape(str(row["kind"])), count=int(row["материалов"]),
+                    titles=int(row["в_заголовках"] or 0), last=when(row["последний"]))
+                for row in строки)
+        )
+    подсказка = ("<p class=тихо>Извлечение — правилами, без модели: кавычки и правовые формы "
+                 "для организаций, «Имя Фамилия» для людей, суммы с рублями, улицы и мосты "
+                 "для мест. Это наблюдение «в тексте встретилось», а не утверждение о "
+                 "причастности [NEWS-008].</p>")
+    return page("Кто и что", '<div class=виды>{}</div>{}{}{}'.format(кнопки, форма, тело,
+                                                                     подсказка),
+                theme, "/сущности")
+
+
+def entity_page(conn: Any, raw_id: Any, theme: str = "система") -> str | None:
+    """Карточка сущности: где встречалась и когда о ней писали."""
+    try:
+        entity_id = int(str(raw_id))
+    except (TypeError, ValueError):
+        return None
+    карточка = store.entity(conn, entity_id)
+    if карточка is None:
+        return None
+    материалы = store.entity_items(conn, entity_id)
+    дни = store.entity_days(conn, entity_id, 30)
+    предел = max([int(day["сколько"]) for day in дни] or [1])
+    полоска = "".join(
+        '<span class=день title="{день}: {сколько}" style="height:{высота}px"></span>'.format(
+            день=html.escape(str(day["день"] or "")), сколько=int(day["сколько"]),
+            высота=max(2, round(38 * int(day["сколько"]) / предел)))
+        for day in дни
+    )
+    строки = "".join(
+        '<li><a href="/материал?id={id}">{title}</a><br><span class=тихо>{source} · {when}'
+        '{head}{gone} · <a href="{url}" rel="noreferrer">оригинал</a></span></li>'.format(
+            id=int(row["id"]), title=html.escape(str(row["title"] or "без заголовка")),
+            source=label(row["source"]), when=when(row["published_at"] or row["listed_at"]),
+            head=" · в заголовке" if row["in_title"] else "",
+            gone=' · <span class=снято>снято</span>' if row["gone_at"] else "",
+            url=html.escape(str(row["url"] or "")))
+        for row in материалы
+    )
+    тело = (
+        '<p class=тихо>{kind} · материалов: {count}</p>'
+        '<div class=полоска>{полоска}</div>'
+        '<p class=тихо>Упоминания по дням за месяц. Пустой день — мы ничего не видели, '
+        'а не «ничего не писали» [NEWS-001].</p>'
+        '<h2>Где встречается</h2><ul>{строки}</ul>'
+        '<p><a href="/лента?q={поиск}">Искать это слово в ленте</a></p>'
+    ).format(kind=html.escape(str(карточка["kind"])), count=len(материалы),
+             полоска=полоска or '<span class=тихо>пусто</span>', строки=строки,
+             поиск=urllib.parse.quote(str(карточка["name"])))
+    return page(str(карточка["name"]), тело, theme, "/сущности")
+
+
+def bursts_page(conn: Any, theme: str = "система") -> str:
+    """Всплески: о ком вдруг стали писать чаще обычного."""
+    строки = store.bursts(conn)
+    if not строки:
+        тело = ("<p class=тихо>Всплесков не видно. Это значит, что за последние двое суток "
+                "никто не выбился из своего обычного фона [NEWS-001].</p>")
+    else:
+        тело = ("<table><tr><th>кто или что</th><th>вид</th><th>за двое суток</th>"
+                "<th>фон в день</th><th>во сколько раз</th></tr>{}</table>").format(
+            "".join(
+                '<tr><td><a href="/сущность?id={id}">{name}</a></td><td class=тихо>{kind}</td>'
+                "<td>{сейчас}</td><td>{фон}</td><td>{раз}</td></tr>".format(
+                    id=int(row["id"]), name=html.escape(str(row["имя"])),
+                    kind=html.escape(str(row["вид"])), сейчас=row["сейчас"], фон=row["фон"],
+                    раз="впервые" if row["новое"] else "×{}".format(row["во_сколько_раз"]))
+                for row in строки)
+        )
+    return page("Всплески", тело +
+                "<p class=тихо>Считаем упоминания за двое суток против среднего за месяц. "
+                "Всплеск говорит «стали писать чаще», а не «что-то случилось»: объяснение "
+                "остаётся за человеком [NEWS-008].</p>", theme, "/всплески")
+
+
 def copy_page(conn: Any, raw_id: Any) -> str | None:
     """Сохранённая копия страницы как есть. `None` — такой копии нет."""
     try:
@@ -872,8 +994,8 @@ def link_message(url: str) -> str:
             "<code>ssh -N -L 6769:127.0.0.1:6769 пользователь@сервер</code>").format(url)
 
 
-__all__ = ("MENU", "PER_PAGE", "STYLE", "THEMES", "changes_page", "copy_page", "feed",
-           "stream_page",
+__all__ = ("MENU", "PER_PAGE", "STYLE", "THEMES", "bursts_page", "changes_page", "copy_page",
+           "entities_page", "entity_page", "feed", "stream_page",
            "home", "item_page", "label", "lag", "latency", "link_message", "login", "oops",
            "page", "queries_page", "search_page", "sidebar", "sources_page", "story_page",
            "telegram_page", "theme_class", "when")
