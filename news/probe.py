@@ -26,7 +26,7 @@ from typing import Any
 
 import diag
 
-from . import fetch, sources
+from . import fetch, sources, telegram
 
 
 async def run_source(
@@ -109,6 +109,7 @@ def main(argv: Any = None) -> int:
     parser.add_argument("--diag", action="store_true", help="писать события в data/diag")
     args = parser.parse_args(argv)
 
+    telegram.hush()
     codes = args.source or [source.code for source in sources.ALL]
     unknown = [code for code in codes if code not in sources.BY_CODE]
     if unknown:

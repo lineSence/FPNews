@@ -162,6 +162,8 @@ def main(argv: Any = None) -> int:
     parser.add_argument("--latency", action="store_true", help="только показать задержки")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # Без этого каждый поход в Telegram печатает в журнал адрес с токеном.
+    telegram.hush()
 
     if args.latency:
         conn = store.connect(args.db)

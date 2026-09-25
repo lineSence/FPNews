@@ -97,3 +97,18 @@ def test_сообщение_экранируется(tmp_path: Path) -> None:
     hit = topics.Hit(topic_id=1, user_id=7, title="дрон", words=("дрон",), in_title=True)
     text = deliver.message(item, hit)
     assert "&lt;b&gt;Дрон&lt;/b&gt; &amp; Ко" in text
+
+
+def test_токен_не_попадает_в_лог(monkeypatch) -> None:
+    """Токен — часть адреса Telegram, а журнал читают и пересылают [CORE-012]."""
+    import logging
+
+    from news import telegram
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:AAsecretsecretsecretsecret")
+    telegram.hush()
+    assert logging.getLogger("httpx").level == logging.WARNING
+    ошибка = "error at https://api.telegram.org/bot123456:AAsecretsecretsecretsecret/getUpdates"
+    assert "AAsecret" not in telegram.safe(ошибка)
+    # Чужой токен в тексте тоже маскируется.
+    assert "bot…" in telegram.safe("bot999999:BBotherotherotherother/sendMessage")

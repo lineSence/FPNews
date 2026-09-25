@@ -13,13 +13,28 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any
 
 import httpx
 
 log = logging.getLogger("fpnews.telegram")
 
+
+def hush() -> None:
+    """Затыкает httpx: он пишет в лог полный адрес запроса.
+
+    У Telegram токен — часть адреса, поэтому обычный INFO-лог httpx означает
+    токен в journald открытым текстом, а журнал читают, пересылают и кладут в
+    отчёты. Секрет не должен попадать в лог ни при каких настройках
+    подробности [CORE-012].
+    """
+    for name in ("httpx", "httpcore", "hpack"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
 API = "https://api.telegram.org/bot{token}/{method}"
+# На случай, если в тексте ошибки окажется чужой или старый токен.
+TOKEN_RE = re.compile(r"bot\d{6,}:[A-Za-z0-9_-]{20,}")
 # Телеграм режет сообщения на 4096 символах; оставляем запас на разметку.
 MAX_TEXT = 3900
 
@@ -28,10 +43,20 @@ def token() -> str:
     return (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 
 
+def safe(value: object) -> str:
+    """Текст без токена: ошибки httpx содержат адрес запроса целиком."""
+    text = str(value or "")
+    secret = token()
+    if secret:
+        text = text.replace(secret, "…")
+    return TOKEN_RE.sub("bot…", text)
+
+
 class Bot:
     """Обёртка над двумя методами API. Без токена молча ничего не делает."""
 
     def __init__(self, session: httpx.AsyncClient, bot_token: str = "") -> None:
+        hush()
         self.session = session
         self.token = bot_token or token()
         self.offset = 0
@@ -50,10 +75,10 @@ class Bot:
             )
             data = response.json()
         except Exception as exc:  # noqa: BLE001 — чужая сеть [CORE-017]
-            log.warning("телеграм %s не ответил: %s", method, exc)
+            log.warning("телеграм %s не ответил: %s", method, safe(exc))
             return None
         if not data.get("ok"):
-            log.warning("телеграм %s отказал: %s", method, str(data)[:200])
+            log.warning("телеграм %s отказал: %s", method, safe(data)[:200])
             return None
         return data
 
@@ -79,4 +104,4 @@ class Bot:
         return result
 
 
-__all__ = ("API", "Bot", "MAX_TEXT", "token")
+__all__ = ("API", "Bot", "MAX_TEXT", "hush", "safe", "token")
