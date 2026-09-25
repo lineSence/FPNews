@@ -20,7 +20,8 @@ from typing import Any
 
 import diag
 
-from . import article, dedup, deliver, fetch, model, recheck, sources, store, story, telegram
+from . import (article, dedup, deliver, fetch, model, recheck, sources, store, story,
+               telegram, web)
 
 log = logging.getLogger("fpnews")
 
@@ -147,6 +148,7 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
             if bot.ready
             else None
         )
+        site = asyncio.create_task(web.serve(conn, stop), name="веб")
         keeper = asyncio.create_task(
             recheck.loop(bot, session, conn, stop), name="перечитывание"
         )
@@ -157,13 +159,14 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
         done.set()
         sent = await sender
         stop.set()
-        summary_changes = await keeper
+        changes = await keeper
+        site.cancel()
         if talker is not None:
             stop.set()
             talker.cancel()
     summary = report(conn)
     summary["разослано"] = sent
-    summary["досылок_об_изменениях"] = summary_changes
+    summary["досылок_об_изменениях"] = changes
     summary["вызовов_модели"] = budget.calls
     if budget.embeds:
         summary["векторов"] = budget.embeds

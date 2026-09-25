@@ -48,11 +48,11 @@ def _db(tmp_path: Path):
     return conn
 
 
-def test_косинус_считается_по_упакованным(tmp_path: Path) -> None:
+def test_косинус_считается_по_упакованным() -> None:
     first = embed.pack([3.0, 0.0])
     same = embed.pack([10.0, 0.0])
     other = embed.pack([0.0, 1.0])
-    assert round(embed.similarity(first, same), 6) == 1.0, "длина не важна, важно направление"
+    assert round(embed.similarity(first, same), 6) == 1.0, "важна не длина, а направление"
     assert round(embed.similarity(first, other), 6) == 0.0
     assert embed.similarity(first, embed.pack([1.0, 0.0, 0.0])) == 0.0, "разная длина — не сравнение"
 
@@ -117,7 +117,7 @@ def test_без_шлюза_склейка_молчит(tmp_path: Path) -> None:
     assert asyncio.run(story.link(None, conn, row, model.Budget())) is None
 
 
-def test_потолок_векторов_держит(tmp_path: Path) -> None:
+def test_потолок_векторов_держит() -> None:
     budget = model.Budget()
     budget.max_embeds = 1
     assert budget.take_embed() is True and budget.take_embed() is False
@@ -158,9 +158,7 @@ def test_досылка_уходит_только_получившим(tmp_path:
     assert asyncio.run(deliver.send_change(fake, conn, item, text)) == 1
     assert "Изменение в новости" in fake.sent[-1][1]
     assert "https://www.fontanka.ru/1/" in fake.sent[-1][1]
-    # Второй раз то же изменение не уходит.
     assert asyncio.run(deliver.send_change(fake, conn, item, text)) == 0
-    # Не получившему первую версию досылка не нужна.
     bot_module.ensure_user(conn, 9, "Другой")
     bot_module.add_topic(conn, 9, "суд")
     assert asyncio.run(deliver.send_change(fake, conn, item, text)) == 0
@@ -197,5 +195,4 @@ def test_перечитывание_замечает_правку_и_досыл�
     row = conn.execute("SELECT title, checks FROM items WHERE id = ?", (item,)).fetchone()
     assert row["title"] == "Чиновник арестован судом" and row["checks"] == 1
     assert store.last_revision(conn, item)["title"] == "Чиновник арестован судом"
-    # Второй заход по расписанию ещё не наступил.
     assert recheck.due(conn) == []

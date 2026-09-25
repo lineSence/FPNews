@@ -30,7 +30,8 @@ HELP = (
     "<b>/добавить</b> слова через запятую — новая тема\n"
     "<b>/темы</b> — список\n"
     "<b>/удалить</b> номер — убрать тему\n"
-    "<b>/задержка</b> — как быстро доходят новости\n\n"
+    "<b>/задержка</b> — как быстро доходят новости\n"
+    "<b>/вход</b> — ссылка в веб-интерфейс\n\n"
     "Тема ловит слова в любой форме: «дрон» найдёт «дроны» и «дронов». "
     "Фраза в кавычках ищется целиком.\n\n"
     "Под каждой новостью три кнопки — выжимка, цитата, оценка. "
@@ -110,6 +111,14 @@ def latency_text(conn: sqlite3.Connection) -> str:
     return "\n".join(lines)
 
 
+def login_link(conn: sqlite3.Connection, user_id: int) -> str:
+    """Одноразовая ссылка в веб. Пароля нет — значит нечему утечь."""
+    from . import pages, web  # noqa: PLC0415 — импорт здесь разрывает круг
+
+    return pages.link_message("{}/вход?код={}".format(web.base_url(),
+                                                      web.code_for(conn, user_id)))
+
+
 def answer(conn: sqlite3.Connection, user_id: int, name: str, text: str) -> str:
     """Ответ на одно сообщение. Чистая функция — потому и тестируется легко."""
     body = (text or "").strip()
@@ -127,6 +136,8 @@ def answer(conn: sqlite3.Connection, user_id: int, name: str, text: str) -> str:
         return drop_topic(conn, user_id, tail)
     if command in ("задержка", "latency"):
         return latency_text(conn)
+    if command in ("вход", "login", "веб", "web"):
+        return login_link(conn, user_id)
     return "Не понимаю. " + HELP
 
 
@@ -192,4 +203,4 @@ async def serve(bot: Any, conn: sqlite3.Connection, stop: Any, rounds: int = 0,
 
 
 __all__ = ("HELP", "add_topic", "answer", "drop_topic", "ensure_user", "latency_text",
-           "list_topics", "press", "serve")
+           "list_topics", "login_link", "press", "serve")

@@ -102,6 +102,21 @@ SCHEMA = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS sessions (
+        token      TEXT PRIMARY KEY,           -- случайные 24 байта
+        user_id    INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS login_codes (
+        code       TEXT PRIMARY KEY,           -- одноразовый, пять минут
+        user_id    INTEGER NOT NULL,
+        expires_at TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS enrichments (
         item_id    INTEGER NOT NULL,
         kind       TEXT NOT NULL,              -- выжимка | цитата | оценка
