@@ -99,13 +99,24 @@ def _fallback(body: str) -> Parsed:
     )
 
 
-async def load(session: Any, url: str) -> Parsed:
-    """Скачать и разобрать. Сбой сети — пустой разбор, а не исключение."""
+async def load_page(session: Any, url: str) -> tuple[Any, Parsed]:
+    """Опрос и разбор вместе: нужен и код ответа, и исходный HTML.
+
+    Код ответа отличает «сеть моргнула» от «материал сняли», а исходный HTML —
+    это доказательная копия: пересказ проверить нельзя, копию можно
+    `[NEWS-007]`.
+    """
     poll = await fetch.poll(session, url, fetch.Door())
     if not poll.body:
         log.warning("страница %s не прочиталась: код %s %s", url, poll.status, poll.error)
-        return Parsed()
-    return parse(poll.body)
+        return poll, Parsed()
+    return poll, parse(poll.body)
 
 
-__all__ = ("BLOCK", "Parsed", "SCRIPT", "load", "parse")
+async def load(session: Any, url: str) -> Parsed:
+    """Скачать и разобрать. Сбой сети — пустой разбор, а не исключение."""
+    _, parsed = await load_page(session, url)
+    return parsed
+
+
+__all__ = ("BLOCK", "Parsed", "SCRIPT", "load", "load_page", "parse")
