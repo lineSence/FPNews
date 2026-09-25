@@ -20,7 +20,7 @@ from typing import Any
 
 import diag
 
-from . import fetch, sources, store
+from . import deliver, fetch, sources, store, telegram
 
 log = logging.getLogger("fpnews")
 
@@ -48,7 +48,28 @@ def report(conn: Any, limit: int = 200) -> dict[str, Any]:
     return out
 
 
+async def dispatch(bot: Any, conn: Any, queue: "asyncio.Queue[int]", stop: Any, done: Any) -> int:
+    """Контур рассылки: берёт новость из очереди и отдаёт подписчикам.
+
+    Отдельная задача, а не часть сторожа: медленный Telegram не имеет права
+    задерживать следующий опрос ленты [NEWS-002].
+    """
+    sent = 0
+    while True:
+        try:
+            item_id = await asyncio.wait_for(queue.get(), timeout=1.0)
+        except asyncio.TimeoutError:
+            if done.is_set() or stop.is_set():
+                return sent
+            continue
+        try:
+            sent += await deliver.send_item(bot, conn, item_id)
+        except Exception as exc:  # noqa: BLE001 — рассылка не роняет сбор [CORE-017]
+            log.warning("рассылка новости %s сорвалась: %s", item_id, exc)
+
+
 async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
+    from . import bot as bot_module  # noqa: PLC0415
     from . import watch  # noqa: PLC0415 — импорт здесь держит модуль запуска лёгким
 
     conn = store.connect(path)
@@ -62,19 +83,35 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
                 events.add_signal_handler(sig, stop.set)
             except NotImplementedError:  # pragma: no cover — Windows
                 pass
+    done = asyncio.Event()
     async with fetch.client() as session:
-        tasks = [
+        bot = telegram.Bot(session)
+        if not bot.ready:
+            log.warning("TELEGRAM_BOT_TOKEN не задан: новости будут копиться в базе без рассылки")
+        watchers = [
             asyncio.create_task(
                 watch.loop(session, sources.BY_CODE[code], conn, stop, queue, rounds),
                 name="сторож-{}".format(code),
             )
             for code in codes
         ]
+        sender = asyncio.create_task(dispatch(bot, conn, queue, stop, done), name="рассылка")
+        talker = (
+            asyncio.create_task(bot_module.serve(bot, conn, stop), name="бот")
+            if bot.ready
+            else None
+        )
         try:
-            await asyncio.gather(*tasks)
+            await asyncio.gather(*watchers)
         except asyncio.CancelledError:  # pragma: no cover — снаружи
             stop.set()
+        done.set()
+        sent = await sender
+        if talker is not None:
+            stop.set()
+            talker.cancel()
     summary = report(conn)
+    summary["разослано"] = sent
     summary["в_очереди_на_обработку"] = queue.qsize()
     conn.close()
     return summary

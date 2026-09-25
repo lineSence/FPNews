@@ -1,0 +1,154 @@
+"""Бот: подписки на темы. Один бот на всех, выдача индивидуальная.
+
+Команды нарочно короткие и русские — ими пользуются с телефона:
+
+    /старт          — завести себя
+    /темы           — список своих тем
+    /добавить дроны, беспилотники, бпла
+    /удалить 3
+    /задержка       — как быстро доходят новости
+
+Команд управления источниками нет: список изданий общий и меняется в коде, а
+не пользователем. Что своё у каждого — темы и подписка `[NEWS-005]`.
+"""
+
+from __future__ import annotations
+
+import logging
+import sqlite3
+from typing import Any
+
+from . import run as run_module
+from . import store, topics
+
+log = logging.getLogger("fpnews.bot")
+
+HELP = (
+    "Я приношу новости выбранных изданий по вашим темам.\n\n"
+    "<b>/добавить</b> слова через запятую — новая тема\n"
+    "<b>/темы</b> — список\n"
+    "<b>/удалить</b> номер — убрать тему\n"
+    "<b>/задержка</b> — как быстро доходят новости\n\n"
+    "Тема ловит слова в любой форме: «дрон» найдёт «дроны» и «дронов». "
+    "Фраза в кавычках ищется целиком."
+)
+
+
+def ensure_user(conn: sqlite3.Connection, user_id: int, name: str = "") -> None:
+    conn.execute(
+        "INSERT INTO users(id, name, created_at) VALUES(?,?,?) "
+        "ON CONFLICT(id) DO UPDATE SET name = excluded.name",
+        (user_id, name, store.now()),
+    )
+    conn.commit()
+
+
+def add_topic(conn: sqlite3.Connection, user_id: int, raw: str) -> str:
+    words = topics.parse_words(raw)
+    if not words:
+        return "Нужны слова: <code>/добавить дроны, бпла</code>"
+    title = words[0]
+    conn.execute(
+        "INSERT INTO topics(user_id, title, words, created_at) VALUES(?,?,?,?)",
+        (user_id, title, ", ".join(words), store.now()),
+    )
+    conn.commit()
+    return "Тема «{}» добавлена: {}".format(title, ", ".join(words))
+
+
+def list_topics(conn: sqlite3.Connection, user_id: int) -> str:
+    rows = conn.execute(
+        "SELECT id, title, words, enabled FROM topics WHERE user_id = ? ORDER BY id",
+        (user_id,),
+    ).fetchall()
+    if not rows:
+        return "Тем пока нет. <code>/добавить дроны, бпла</code>"
+    lines = [
+        "{}. <b>{}</b> — {}{}".format(
+            row["id"], row["title"], row["words"], "" if row["enabled"] else " (выключена)"
+        )
+        for row in rows
+    ]
+    return "\n".join(lines)
+
+
+def drop_topic(conn: sqlite3.Connection, user_id: int, raw: str) -> str:
+    try:
+        topic_id = int(str(raw).strip())
+    except ValueError:
+        return "Нужен номер темы: <code>/удалить 3</code>"
+    cursor = conn.execute(
+        "DELETE FROM topics WHERE id = ? AND user_id = ?", (topic_id, user_id)
+    )
+    conn.commit()
+    return "Удалено" if cursor.rowcount else "Такой темы у вас нет"
+
+
+def latency_text(conn: sqlite3.Connection) -> str:
+    data = run_module.report(conn, 200)
+    if not data.get("новостей"):
+        return "Пока нечего мерить: новостей после запуска не было."
+    lines = ["Задержки по последним {} новостям, секунды:".format(data["новостей"])]
+    names = {
+        "редакционная": "издание → лента",
+        "до_отправки": "лента → сообщение",
+        "до_полного": "сообщение → дополнение",
+    }
+    for key, label in names.items():
+        cell = data.get(key)
+        if not cell:
+            continue
+        lines.append(
+            "{}: медиана {}, девяностый {}, максимум {}".format(
+                label, cell["медиана"], cell["девяностый"], cell["максимум"]
+            )
+        )
+    return "\n".join(lines)
+
+
+def answer(conn: sqlite3.Connection, user_id: int, name: str, text: str) -> str:
+    """Ответ на одно сообщение. Чистая функция — потому и тестируется легко."""
+    body = (text or "").strip()
+    command, _, tail = body.partition(" ")
+    command = command.lower().lstrip("/").split("@")[0]
+    if command in ("старт", "start", "помощь", "help"):
+        ensure_user(conn, user_id, name)
+        return HELP
+    ensure_user(conn, user_id, name)
+    if command in ("добавить", "add"):
+        return add_topic(conn, user_id, tail)
+    if command in ("темы", "topics"):
+        return list_topics(conn, user_id)
+    if command in ("удалить", "del", "delete"):
+        return drop_topic(conn, user_id, tail)
+    if command in ("задержка", "latency"):
+        return latency_text(conn)
+    return "Не понимаю. " + HELP
+
+
+async def serve(bot: Any, conn: sqlite3.Connection, stop: Any, rounds: int = 0) -> int:
+    """Длинный опрос обновлений. Отдельная задача, сторожам не мешает."""
+    handled = 0
+    while not stop.is_set():
+        for update in await bot.updates():
+            message = update.get("message") or update.get("edited_message") or {}
+            chat = message.get("chat") or {}
+            user = message.get("from") or {}
+            if not chat.get("id"):
+                continue
+            reply = answer(
+                conn,
+                int(chat["id"]),
+                str(user.get("first_name") or ""),
+                str(message.get("text") or ""),
+            )
+            await bot.send(int(chat["id"]), reply, preview=False)
+            handled += 1
+        rounds -= 1
+        if rounds == 0:
+            break
+    return handled
+
+
+__all__ = ("HELP", "add_topic", "answer", "drop_topic", "ensure_user", "latency_text",
+           "list_topics", "serve")
