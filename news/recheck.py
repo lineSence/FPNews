@@ -29,6 +29,9 @@ log = logging.getLogger("fpnews.recheck")
 
 # Через сколько секунд после обнаружения делается заход номер N.
 STEPS = (600, 1800, 7200, 21600)
+# Коды, по которым материал считается снятым с публикации. 403 и 429 сюда не
+# входят: это защита сайта от нас, а не исчезновение текста [CORE-017].
+GONE_CODES = (404, 410)
 # Текст вырос настолько — это дописанный материал, а не правка опечатки.
 GROWTH = 0.25
 MIN_GROWTH_CHARS = 400
@@ -37,7 +40,7 @@ MIN_GROWTH_CHARS = 400
 def due(conn: Any, limit: int = 20) -> list[dict[str, Any]]:
     """Материалы, которым пора на перечитывание. Самые свежие первыми."""
     rows = conn.execute(
-        "SELECT id, url, title, body, checks, listed_at, checked_at FROM items "
+        "SELECT id, url, title, body, checks, listed_at, checked_at, gone_at FROM items "
         "WHERE cold = 0 AND sent_at IS NOT NULL AND checks < ? "
         "AND listed_at >= datetime('now', '-1 day') ORDER BY listed_at DESC LIMIT ?",
         (len(STEPS), int(limit * 4)),
@@ -77,6 +80,15 @@ def changed(old: dict[str, Any], title: str, body: str) -> str:
     return ""
 
 
+def gone_message(item: dict[str, Any], code: int) -> str:
+    """Сообщение о снятии. Говорим ровно то, что видели: код и время."""
+    return (
+        "<i>Материал снят с публикации</i> — ответ {code}\n\n<b>{title}</b>\n\n"
+        "Копия страницы сохранена у нас.\n{url}"
+    ).format(code=int(code), title=html.escape(str(item.get("title") or "")),
+             url=item.get("url"))
+
+
 def message(item: dict[str, Any], kind: str, title: str) -> str:
     """Досылка. Коротко: что изменилось, как теперь, ссылка `[NEWS-007]`."""
     if kind == "заголовок":
@@ -96,13 +108,27 @@ async def once(bot: Any, session: Any, conn: Any, limit: int = 20) -> int:
 
     sent = 0
     for item in due(conn, limit):
-        store.mark_checked(conn, int(item["id"]))
-        parsed = await article.load(session, str(item["url"]))
+        item_id = int(item["id"])
+        store.mark_checked(conn, item_id)
+        poll, parsed = await article.load_page(session, str(item["url"]))
+        if poll.status in GONE_CODES:
+            # Исчезновение — само по себе наблюдение, и оно ценнее правки.
+            if not item.get("gone_at"):
+                store.mark_gone(conn, item_id, poll.status)
+                sent += await deliver.send_change(bot, conn, item_id,
+                                                  gone_message(item, poll.status))
+            else:
+                store.mark_gone(conn, item_id, poll.status)
+            continue
         if parsed.empty:
             continue
+        if item.get("gone_at"):
+            store.revive(conn, item_id)
+        if poll.body:
+            store.save_snapshot(conn, item_id, poll.body)
         title = parsed.title or str(item.get("title") or "")
-        store.revise(conn, int(item["id"]), title, len(parsed.body),
-                     dedup.simhash(parsed.body))
+        store.revise(conn, item_id, title, len(parsed.body),
+                     dedup.simhash(parsed.body), parsed.body)
         kind = changed(item, title, parsed.body)
         if not kind:
             continue
@@ -138,5 +164,5 @@ async def loop(bot: Any, session: Any, conn: Any, stop: Any, every: float = 120.
     return sent
 
 
-__all__ = ("GROWTH", "MIN_GROWTH_CHARS", "STEPS", "changed", "due", "loop", "message",
-           "once")
+__all__ = ("GONE_CODES", "GROWTH", "MIN_GROWTH_CHARS", "STEPS", "changed", "due",
+           "gone_message", "loop", "message", "once")
