@@ -64,6 +64,39 @@ def nearest(conn: Any, item_id: int, vec: bytes) -> Match | None:
     return best
 
 
+def similar(conn: Any, item_id: int, limit: int = 8, days: int = 30,
+            scan: int = 1500) -> list[dict[str, Any]]:
+    """Похожие по смыслу среди уже посчитанных векторов. Ни одного вызова сети.
+
+    Вектор новости появляется только тогда, когда её кто-то получил и работала
+    смысловая склейка [CORE-016]. Поэтому пустой список здесь означает «мы не
+    считали вектор», а не «похожих нет» [NEWS-001]. Считаем на месте: полторы
+    тысячи векторов по 1024 числа — это десятки миллисекунд на одном ядре.
+    """
+    from . import store  # noqa: PLC0415 — импорт здесь, чтобы не было круга
+
+    свой = store.vector_of(conn, int(item_id), embed.name())
+    if not свой:
+        return []
+    rows = conn.execute(
+        "SELECT i.id, i.title, i.url, i.source, i.published_at, i.listed_at, i.dup_of, v.vec "
+        "FROM vectors v JOIN items i ON i.id = v.item_id WHERE v.model = ? AND i.id != ? "
+        "AND COALESCE(i.published_at, i.listed_at) >= datetime('now', ?) "
+        "ORDER BY i.id DESC LIMIT ?",
+        (embed.name(), int(item_id), "-{} days".format(int(days)), int(scan)),
+    ).fetchall()
+    out = []
+    for row in rows:
+        score = embed.similarity(свой, bytes(row["vec"]))
+        out.append({
+            "id": int(row["id"]), "заголовок": row["title"], "url": row["url"],
+            "источник": row["source"], "когда": row["published_at"] or row["listed_at"],
+            "перепечатка_из": row["dup_of"], "похожесть": round(float(score), 3),
+        })
+    out.sort(key=lambda row: row["похожесть"], reverse=True)
+    return out[:max(1, int(limit))]
+
+
 async def link(session: Any, conn: Any, item: dict[str, Any],
                budget: model.Budget) -> Match | None:
     """Найти, о чём это уже писали, по смыслу. None — не нашли или не звонили.
@@ -89,4 +122,4 @@ async def link(session: Any, conn: Any, item: dict[str, Any],
 
 
 __all__ = ("DEFAULT_THRESHOLD", "Match", "NOTE_THRESHOLD", "WINDOW_HOURS", "link",
-           "nearest", "threshold")
+           "nearest", "similar", "threshold")
