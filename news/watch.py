@@ -21,7 +21,7 @@ from typing import Any
 
 import diag
 
-from . import fetch, sources, store
+from . import bridge, fetch, sources, store
 
 log = logging.getLogger("fpnews.watch")
 
@@ -49,7 +49,11 @@ async def once(
     queue: "asyncio.Queue[int] | None" = None,
 ) -> Step:
     """Один заход к двери. Возвращает, что нашлось и что оказалось новым."""
-    poll = await fetch.poll(session, source.door, door)
+    bridge.у_двери(source.code, True)
+    try:
+        poll = await fetch.poll(session, source.door, door)
+    finally:
+        bridge.у_двери(source.code, False)
     step = Step(
         status=poll.status,
         seconds=poll.seconds,
@@ -62,6 +66,7 @@ async def once(
             log.warning("%s: защита ответила %s, пауза ×%s", source.label, poll.status, door.backoff)
         diag.event("опрос", площадка=source.code, код=poll.status, секунд=round(poll.seconds, 3),
                    байт=poll.size, условный=poll.conditional, ошибка=poll.error)
+        bridge.заход(source.code, код=poll.status, найдено=0, новых=0, ошибка=poll.error)
         return step
 
     found = sources.extract(source, poll.body)
@@ -107,6 +112,7 @@ async def once(
             queue.put_nowait(item_id)
     diag.event("опрос", площадка=source.code, код=poll.status, секунд=round(poll.seconds, 3),
                байт=poll.size, ссылок=step.found, новых=step.fresh, холодных=step.cold)
+    bridge.заход(source.code, код=poll.status, найдено=step.found, новых=step.fresh)
     if step.cold:
         log.info("%s: холодный старт, подобрано %s — не считаем и не шлём",
                  source.label, step.cold)
@@ -131,6 +137,25 @@ async def loop(
     """
     door = fetch.Door()
     rounds = 0
+    просьба = bridge.подписаться(source.code)
+    try:
+        return await _обход(session, source, conn, stop, queue, limit, door, просьба)
+    finally:
+        bridge.отписаться(source.code)
+
+
+async def _обход(
+    session: Any,
+    source: sources.Source,
+    conn: sqlite3.Connection,
+    stop: asyncio.Event,
+    queue: "asyncio.Queue[int] | None",
+    limit: int,
+    door: fetch.Door,
+    просьба: asyncio.Event,
+) -> int:
+    """Сам круг заходов. Вынесен, чтобы подписка на просьбы снималась всегда."""
+    rounds = 0
     while not stop.is_set():
         await once(session, source, conn, door, queue)
         rounds += 1
@@ -139,10 +164,18 @@ async def loop(
         # Интервал можно переопределить в интерфейсе: у разных лент разный темп,
         # а править код ради этого не должно быть нужно.
         every = store.source_every(conn, source.code) or source.interval
+        # Просьба со страницы «Опросить сейчас» будит раньше срока. Откат от
+        # чужой защиты она не отменяет: пауза считается тем же способом, а
+        # разбуженный сторож просто идёт к двери на круг раньше [NEWS-006].
+        просьба.clear()
+        ждём = [asyncio.create_task(stop.wait()), asyncio.create_task(просьба.wait())]
         try:
-            await asyncio.wait_for(stop.wait(), timeout=every * door.backoff)
-        except asyncio.TimeoutError:
-            continue
+            await asyncio.wait(ждём, timeout=every * door.backoff,
+                               return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for задача in ждём:
+                задача.cancel()
+        просьба.clear()
     return rounds
 
 
