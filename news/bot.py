@@ -7,6 +7,7 @@
     /добавить дроны, беспилотники, бпла
     /удалить 3
     /задержка       — как быстро доходят новости
+    /сводка 09:00   — ежедневная сводка вместо потока
 
 Команд управления источниками нет: список изданий общий и меняется в коде, а
 не пользователем. Что своё у каждого — темы и подписка `[NEWS-005]`.
@@ -31,6 +32,7 @@ HELP = (
     "<b>/темы</b> — список\n"
     "<b>/удалить</b> номер — убрать тему\n"
     "<b>/задержка</b> — как быстро доходят новости\n"
+    "<b>/сводка</b> — что я пропустил; «/сводка 09:00» — присылать каждый день\n"
     "<b>/вход</b> — ссылка в веб-интерфейс\n\n"
     "Тема ловит слова в любой форме: «дрон» найдёт «дроны» и «дронов». "
     "Фраза в кавычках ищется целиком.\n\n"
@@ -111,6 +113,29 @@ def latency_text(conn: sqlite3.Connection) -> str:
     return "\n".join(lines)
 
 
+def digest_text(conn: sqlite3.Connection, user_id: int, tail: str = "") -> str:
+    """Сводка по требованию и настройка её часа.
+
+        /сводка          — показать прямо сейчас
+        /сводка 09:00    — присылать каждый день в это время
+        /сводка нет      — выключить
+    """
+    from . import digest, web  # noqa: PLC0415 — импорт здесь разрывает круг
+
+    хвост = (tail or "").strip().lower()
+    if хвост in ("нет", "выкл", "off", "стоп"):
+        store.set_digest(conn, user_id, "")
+        return "Ежедневная сводка выключена. «/сводка» без слов покажет её разово."
+    if ":" in хвост:
+        store.set_digest(conn, user_id, хвост)
+        return "Буду присылать сводку каждый день в {}.".format(хвост)
+    data = digest.collect(conn, user_id)
+    if digest.empty(data):
+        return ("За сутки мы не видели ни правок, ни снятий, и по вашим темам ничего не "
+                "приходило. Всего материалов в базе за это время: {}.".format(data["всего"]))
+    return digest.text(data, web.base_url())
+
+
 def login_link(conn: sqlite3.Connection, user_id: int) -> str:
     """Одноразовая ссылка в веб. Пароля нет — значит нечему утечь."""
     from . import pages, web  # noqa: PLC0415 — импорт здесь разрывает круг
@@ -136,6 +161,8 @@ def answer(conn: sqlite3.Connection, user_id: int, name: str, text: str) -> str:
         return drop_topic(conn, user_id, tail)
     if command in ("задержка", "latency"):
         return latency_text(conn)
+    if command in ("сводка", "digest"):
+        return digest_text(conn, user_id, tail)
     if command in ("вход", "login", "веб", "web"):
         return login_link(conn, user_id)
     return "Не понимаю. " + HELP
