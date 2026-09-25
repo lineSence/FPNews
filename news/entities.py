@@ -172,5 +172,62 @@ def save(conn: Any, item_id: int, title: str, body: str = "") -> int:
     return len(rows)
 
 
-__all__ = ("KINDS", "MAX_PER_ITEM", "extract", "money", "normalize", "organisations",
+def backfill(conn: Any, limit: int = 0, chunk: int = 200) -> int:
+    """Разобрать сущности в уже накопленных материалах.
+
+    Нужна один раз после установки шага: старые материалы разбирались, когда
+    правил ещё не было, и в карточках сущностей их не видно. Идём пачками и
+    пропускаем то, что уже разобрано, чтобы команду можно было прервать и
+    запустить снова.
+    """
+    сделано = 0
+    while True:
+        rows = conn.execute(
+            "SELECT id, title, body FROM items WHERE id NOT IN "
+            "(SELECT DISTINCT item_id FROM mentions) ORDER BY id DESC LIMIT ?",
+            (int(chunk),),
+        ).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            save(conn, int(row["id"]), str(row["title"] or ""), str(row["body"] or ""))
+            сделано += 1
+            if limit and сделано >= limit:
+                return сделано
+    return сделано
+
+
+def main(argv: Any = None) -> int:
+    """Разбор сущностей в накопленном архиве.
+
+        python -m news.entities --все            # все материалы без упоминаний
+        python -m news.entities --сколько 100    # только первые сто
+    """
+    import argparse  # noqa: PLC0415
+    import logging  # noqa: PLC0415
+
+    from . import store  # noqa: PLC0415
+
+    parser = argparse.ArgumentParser(description="Сущности в накопленном архиве")
+    parser.add_argument("--db", default=str(store.DEFAULT_PATH), help="файл базы")
+    parser.add_argument("--все", dest="all_items", action="store_true", help="разобрать всё")
+    parser.add_argument("--сколько", dest="limit", type=int, default=0, help="потолок")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if not (args.all_items or args.limit):
+        parser.error("укажите --все или --сколько")
+    conn = store.connect(args.db)
+    try:
+        сделано = backfill(conn, args.limit)
+    finally:
+        conn.close()
+    print("разобрано материалов: {}".format(сделано))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+__all__ = ("KINDS", "backfill", "main", "MAX_PER_ITEM", "extract", "money", "normalize", "organisations",
            "people", "places", "save")
