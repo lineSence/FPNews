@@ -76,7 +76,8 @@ def find(conn: sqlite3.Connection, item: dict[str, Any], hours: int = 12) -> int
     mark = str(item.get("simhash") or "")
     rows = conn.execute(
         "SELECT id, title, simhash FROM items "
-        "WHERE id != ? AND dup_of IS NULL AND listed_at >= datetime('now', ?) "
+        "WHERE id != ? AND dup_of IS NULL "
+        "AND julianday(listed_at) >= julianday('now', ?) "
         "ORDER BY id DESC LIMIT 400",
         (int(item.get("id") or 0), "-{} hours".format(int(hours))),
     ).fetchall()
