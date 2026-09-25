@@ -151,7 +151,7 @@ def link_message(url: str) -> str:
     """Сообщение бота со ссылкой на вход."""
     return ("Ссылка для входа (пять минут, один раз):\n{}\n\n"
             "Если открываете с другой машины — сначала проброс порта:\n"
-            "<code>ssh -N -L 8765:127.0.0.1:8765 пользователь@сервер</code>").format(url)
+            "<code>ssh -N -L 6769:127.0.0.1:6769 пользователь@сервер</code>").format(url)
 
 
 __all__ = ("STYLE", "feed", "home", "latency", "link_message", "login", "nav", "oops", "page")

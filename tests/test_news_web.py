@@ -123,10 +123,10 @@ def test_чужой_заголовок_не_ломает_страницу(tmp_pa
 
 
 def test_бот_присылает_ссылку_на_вход(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("FPNEWS_WEB_URL", "http://localhost:8765")
+    monkeypatch.setenv("FPNEWS_WEB_URL", "http://localhost:6769")
     conn = _db(tmp_path)
     text = bot_module.answer(conn, 7, "Владелец", "/вход")
-    assert "http://localhost:8765/вход?код=" in text
+    assert "http://localhost:6769/вход?код=" in text
     code = text.split("код=")[1].split("\n")[0]
     assert web.redeem(conn, code) == 7
 
