@@ -74,10 +74,16 @@ class Request:
     # Список пар тела формы: галочки «вид» приходят по нескольку штук, а
     # словарь оставил бы только последнюю.
     pairs: list[tuple[str, str]] = field(default_factory=list)
+    # То же для строки запроса: «издание=a&издание=b» в фильтрах ленты.
+    asked: list[tuple[str, str]] = field(default_factory=list)
 
     def all_of(self, name: str) -> list[str]:
         """Все значения поля формы. Для наборов галочек без JavaScript."""
         return [value for key, value in self.pairs if key == name]
+
+    def all_asked(self, name: str) -> list[str]:
+        """Все значения поля строки запроса."""
+        return [value for key, value in self.asked if key == name]
 
     @property
     def cookies(self) -> dict[str, str]:
@@ -133,10 +139,12 @@ def parse(head: str, body: str) -> Request:
         if name:
             headers[name.strip().lower()] = value.strip()
     pairs = urllib.parse.parse_qsl(body, keep_blank_values=True)
+    asked = urllib.parse.parse_qsl(raw_query, keep_blank_values=True)
     return Request(
         method=method,
         path=urllib.parse.unquote(path),
-        query=dict(urllib.parse.parse_qsl(raw_query, keep_blank_values=True)),
+        query=dict(asked),
+        asked=list(asked),
         headers=headers,
         form=dict(pairs),
         pairs=list(pairs),
@@ -292,6 +300,12 @@ def route(conn: Any, request: Request) -> Response:
         elif request.path == "/телеграм/сохранить":
             store.set_kinds(conn, user_id, request.all_of("вид"))
             store.set_quiet(conn, user_id, request.form.get("с", ""), request.form.get("по", ""))
+        elif request.path == "/телеграм/издания":
+            store.set_user_sources(conn, user_id, request.all_of("издание"))
+        elif request.path == "/телеграм/тема":
+            store.set_topic_delivery(conn, _number(request.form.get("номер")), user_id,
+                                     enabled=bool(request.form.get("отдавать")),
+                                     sources=request.all_of("издание"))
         else:
             return Response(pages.oops("Такой формы нет.", theme), status="404 Not Found")
         return redirect(section if section in _SECTIONS else "/")
@@ -303,6 +317,9 @@ def route(conn: Any, request: Request) -> Response:
         return Response(pages.home(conn, user_id, csrf(token), theme))
     if request.path == "/задержки":
         return Response(pages.latency(conn, theme))
+    if request.path == "/лента":
+        return Response(pages.stream_page(conn, user_id, request.query, theme,
+                                          request.all_asked))
     if request.path == "/новости":
         return Response(pages.feed(conn, user_id, theme=theme))
     if request.path == "/поиск":
