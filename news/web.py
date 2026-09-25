@@ -40,7 +40,12 @@ DEFAULT_PORT = 6769
 # Запрос без тела больше этого — не наш: формы здесь по сотне байт.
 MAX_BODY = 64 * 1024
 COOKIE = "fpnews"
+# Тема живёт в отдельной куке: она не секрет и переживает выход из сессии.
+# Имя куки латиницей — русские буквы в имени пришлось бы кодировать, а читать
+# такой заголовок в `curl` стало бы невозможно [CORE-025].
+THEME_COOKIE = "fpnews_theme"
 SESSION_DAYS = 30
+THEME_DAYS = 365
 
 
 def host() -> str:
@@ -66,6 +71,13 @@ class Request:
     query: dict[str, str] = field(default_factory=dict)
     headers: dict[str, str] = field(default_factory=dict)
     form: dict[str, str] = field(default_factory=dict)
+    # Список пар тела формы: галочки «вид» приходят по нескольку штук, а
+    # словарь оставил бы только последнюю.
+    pairs: list[tuple[str, str]] = field(default_factory=list)
+
+    def all_of(self, name: str) -> list[str]:
+        """Все значения поля формы. Для наборов галочек без JavaScript."""
+        return [value for key, value in self.pairs if key == name]
 
     @property
     def cookies(self) -> dict[str, str]:
@@ -120,12 +132,14 @@ def parse(head: str, body: str) -> Request:
         name, _, value = line.partition(":")
         if name:
             headers[name.strip().lower()] = value.strip()
+    pairs = urllib.parse.parse_qsl(body, keep_blank_values=True)
     return Request(
         method=method,
         path=urllib.parse.unquote(path),
         query=dict(urllib.parse.parse_qsl(raw_query, keep_blank_values=True)),
         headers=headers,
-        form=dict(urllib.parse.parse_qsl(body, keep_blank_values=True)),
+        form=dict(pairs),
+        pairs=list(pairs),
     )
 
 
@@ -185,11 +199,50 @@ def cookie_value(token: str) -> str:
     )
 
 
+def theme_cookie(theme: str) -> str:
+    """Кука темы. Значение кодируем: «тёмная» в заголовке — не ASCII."""
+    return "{}={}; Path=/; SameSite=Lax; Max-Age={}".format(
+        THEME_COOKIE, urllib.parse.quote(theme), THEME_DAYS * 86400
+    )
+
+
+def theme_of(request: Request) -> str:
+    """Тема из куки. Незнакомое значение — «система», а не ошибка."""
+    value = urllib.parse.unquote(request.cookies.get(THEME_COOKIE) or "")
+    return value if value in pages.THEMES else "система"
+
+
+def safe_back(where: str) -> str:
+    """Куда вернуться после переключения темы.
+
+    Принимаем только свой путь: «//зло.рф» и «https://зло.рф» браузер считает
+    чужим адресом, и открытый редирект из настройки оформления — подарок для
+    поддельной страницы входа [CORE-016].
+    """
+    where = where or "/"
+    if not where.startswith("/") or where.startswith("//") or "\\" in where:
+        return "/"
+    return where
+
+
 def csrf(token: str) -> str:
     """Метка формы — часть ключа сессии. Чужая вкладка её не знает."""
     import hashlib  # noqa: PLC0415
 
     return hashlib.blake2b((token or "").encode(), digest_size=8).hexdigest()
+
+
+# Разделы, куда возвращаемся после формы: список закрыт, чтобы адрес из
+# формы не превратился в редирект куда попало.
+_SECTIONS = ("/запросы", "/источники", "/телеграм", "/темы")
+
+
+def _number(raw: Any) -> int:
+    """Число из формы. Мусор — ноль: чужой запрос не должен ронять страницу."""
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 0
 
 
 def route(conn: Any, request: Request) -> Response:
@@ -198,17 +251,19 @@ def route(conn: Any, request: Request) -> Response:
 
     token = request.cookies.get(COOKIE) or ""
     user_id = whoami(conn, request)
+    theme = theme_of(request)
     if request.path == "/вход":
         entering = redeem(conn, request.query.get("код", ""))
         if not entering:
-            return Response(pages.login(), status="401 Unauthorized")
+            return Response(pages.login(theme), status="401 Unauthorized")
         return redirect("/", cookie_value(new_session(conn, entering)))
     if not user_id:
-        return Response(pages.login(), status="401 Unauthorized")
+        return Response(pages.login(theme), status="401 Unauthorized")
     if request.method == "POST":
         if request.form.get("метка") != csrf(token):
-            return Response(pages.oops("Форма устарела. Обновите страницу."),
+            return Response(pages.oops("Форма устарела. Обновите страницу.", theme),
                             status="400 Bad Request")
+        section = "/" + request.path.strip("/").split("/")[0]
         if request.path == "/темы/добавить":
             bot_module.add_topic(conn, user_id, request.form.get("слова", ""))
         elif request.path == "/темы/удалить":
@@ -217,27 +272,69 @@ def route(conn: Any, request: Request) -> Response:
             conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
             conn.commit()
             return redirect("/", "{}=; Path=/; Max-Age=0".format(COOKIE))
-        return redirect("/")
+        elif request.path == "/запросы/добавить":
+            store.add_query(
+                conn, user_id, (request.form.get("запрос", "") or "").strip(),
+                source=(request.form.get("источник", "") or "").strip(),
+                only_original=bool(request.form.get("оригиналы")),
+                notify=bool(request.form.get("уведомлять")),
+            )
+        elif request.path == "/запросы/удалить":
+            store.drop_query(conn, _number(request.form.get("номер")), user_id)
+        elif request.path == "/запросы/уведомления":
+            store.toggle_notify(conn, _number(request.form.get("номер")), user_id)
+        elif request.path == "/источники/переключить":
+            code = request.form.get("код", "")
+            store.set_source(conn, code, enabled=not store.source_enabled(conn, code))
+        elif request.path == "/источники/интервал":
+            store.set_source(conn, request.form.get("код", ""),
+                             every=_number(request.form.get("секунд")))
+        elif request.path == "/телеграм/сохранить":
+            store.set_kinds(conn, user_id, request.all_of("вид"))
+            store.set_quiet(conn, user_id, request.form.get("с", ""), request.form.get("по", ""))
+        else:
+            return Response(pages.oops("Такой формы нет.", theme), status="404 Not Found")
+        return redirect(section if section in _SECTIONS else "/")
+    if request.path == "/тема":
+        want = request.query.get("вид", "")
+        chosen = want if want in pages.THEMES else "система"
+        return redirect(safe_back(request.query.get("откуда", "/")), theme_cookie(chosen))
     if request.path == "/":
-        return Response(pages.home(conn, user_id, csrf(token)))
+        return Response(pages.home(conn, user_id, csrf(token), theme))
     if request.path == "/задержки":
-        return Response(pages.latency(conn))
+        return Response(pages.latency(conn, theme))
     if request.path == "/новости":
-        return Response(pages.feed(conn, user_id))
+        return Response(pages.feed(conn, user_id, theme=theme))
     if request.path == "/поиск":
-        return Response(pages.search_page(conn, request.query))
+        return Response(pages.search_page(conn, request.query, theme))
+    if request.path == "/правки":
+        return Response(pages.changes_page(conn, theme))
+    if request.path == "/источники":
+        return Response(pages.sources_page(conn, csrf(token), theme))
+    if request.path == "/телеграм":
+        return Response(pages.telegram_page(conn, user_id, csrf(token), theme))
+    if request.path == "/запросы":
+        return Response(pages.queries_page(conn, user_id, csrf(token), theme))
+    if request.path == "/копия":
+        saved = pages.copy_page(conn, request.query.get("id", ""))
+        if saved is None:
+            return Response(pages.oops("Такой копии нет.", theme), status="404 Not Found")
+        # Отдаём текстом, а не разметкой. Это чужой HTML со скриптами и
+        # счётчиками; показать его как страницу — впустить чужой код в свой
+        # источник и отдать ему куку сессии [CORE-016].
+        return Response(saved, kind="text/plain; charset=utf-8")
     if request.path == "/материал":
-        card = pages.item_page(conn, request.query.get("id", ""))
+        card = pages.item_page(conn, request.query.get("id", ""), theme)
         if card is None:
-            return Response(pages.oops("Такого материала нет."), status="404 Not Found")
+            return Response(pages.oops("Такого материала нет.", theme), status="404 Not Found")
         return Response(card)
     if request.path == "/сюжет":
-        plot = pages.story_page(conn, request.query.get("id", ""))
+        plot = pages.story_page(conn, request.query.get("id", ""), theme)
         if plot is None:
-            return Response(pages.oops("Сюжета нет: других изданий мы не видели."),
+            return Response(pages.oops("Сюжета нет: других изданий мы не видели.", theme),
                             status="404 Not Found")
         return Response(plot)
-    return Response(pages.oops("Такой страницы нет."), status="404 Not Found")
+    return Response(pages.oops("Такой страницы нет.", theme), status="404 Not Found")
 
 
 async def handle(conn: Any, reader: Any, writer: Any) -> None:
@@ -320,4 +417,5 @@ if __name__ == "__main__":
 
 __all__ = ("COOKIE", "DEFAULT_HOST", "DEFAULT_PORT", "Request", "Response",
            "base_url", "code_for", "cookie_value", "csrf", "handle", "host", "new_session",
-           "parse", "main", "port", "redeem", "redirect", "route", "serve", "whoami")
+           "parse", "main", "port", "redeem", "redirect", "route", "safe_back", "serve",
+           "theme_cookie", "theme_of", "whoami")
