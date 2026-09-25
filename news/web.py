@@ -269,8 +269,14 @@ def route(conn: Any, request: Request) -> Response:
         return Response(pages.login(theme), status="401 Unauthorized")
     if request.method == "POST":
         if request.form.get("метка") != csrf(token):
-            return Response(pages.oops("Форма устарела. Обновите страницу.", theme),
-                            status="400 Bad Request")
+            # Причина почти всегда одна: страницу открыли до входа или сессия
+            # сменилась. Пишем в журнал, чтобы «непонятный 400» перестал быть
+            # непонятным, и объясняем человеку, что делать.
+            log.warning("метка формы не совпала: %s (полей в теле: %s)",
+                        request.path, len(request.pairs))
+            return Response(pages.oops(
+                "Форма устарела: страница была открыта до входа или сессия сменилась. "
+                "Обновите страницу и повторите.", theme), status="400 Bad Request")
         section = "/" + request.path.strip("/").split("/")[0]
         if request.path == "/темы/добавить":
             bot_module.add_topic(conn, user_id, request.form.get("слова", ""))
@@ -354,26 +360,80 @@ def route(conn: Any, request: Request) -> Response:
     return Response(pages.oops("Такой страницы нет.", theme), status="404 Not Found")
 
 
+async def read_body(reader: Any, head: str) -> str:
+    """Тело запроса: по длине или кусками.
+
+    Кусками (`Transfer-Encoding: chunked`) тело приходит, когда впереди
+    стоит обратный прокси вроде Caddy. Раньше мы такое тело просто не читали,
+    форма приезжала пустой, метка не совпадала — и человек видел «форма
+    устарела» на каждой второй отправке [CORE-017].
+    """
+    length = 0
+    chunked = False
+    for line in head.split("\r\n"):
+        name, _, value = line.partition(":")
+        name = name.strip().lower()
+        if name == "content-length":
+            try:
+                length = min(int(value.strip() or 0), MAX_BODY)
+            except ValueError:
+                length = 0
+        elif name == "transfer-encoding" and "chunked" in value.lower():
+            chunked = True
+    if chunked:
+        out: list[bytes] = []
+        total = 0
+        while True:
+            line = (await reader.readline()).strip().split(b";")[0]
+            try:
+                size = int(line or b"0", 16)
+            except ValueError:
+                break
+            if size <= 0:
+                break
+            total += size
+            if total > MAX_BODY:
+                break
+            out.append(await reader.readexactly(size))
+            await reader.readexactly(2)  # хвостовые \r\n куска
+        return b"".join(out).decode("utf-8", "replace")
+    if length:
+        return (await reader.readexactly(length)).decode("utf-8", "replace")
+    return ""
+
+
 async def handle(conn: Any, reader: Any, writer: Any) -> None:
+    request = None
     try:
         raw = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10.0)
         head = raw.decode("utf-8", "replace").rstrip("\r\n")
-        length = 0
-        for line in head.split("\r\n"):
-            if line.lower().startswith("content-length:"):
-                length = min(int(line.split(":")[1].strip() or 0), MAX_BODY)
-        body = ""
-        if length:
-            body = (await reader.readexactly(length)).decode("utf-8", "replace")
-        response = route(conn, parse(head, body))
-    except (asyncio.IncompleteReadError, asyncio.TimeoutError, ValueError):
-        response = Response("", status="400 Bad Request")
-    except Exception as exc:  # noqa: BLE001 — веб не роняет сбор новостей [CORE-017]
-        log.warning("страница не отдалась: %s", exc)
-        response = Response(pages.oops("Что-то сломалось."), status="500 Internal Server Error")
+        request = parse(head, await read_body(reader, head))
+    except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError):
+        # Браузер открыл соединение про запас и закрыл, не спросив ничего.
+        # Это не ошибка запроса, и отвечать здесь нечему.
+        writer.close()
+        return
+    except (ValueError, asyncio.LimitOverrunError) as exc:
+        log.warning("запрос не разобран: %s", exc)
+        response = Response("Запрос не разобран.", status="400 Bad Request",
+                            kind="text/plain; charset=utf-8")
+        request = None
+    if request is not None:
+        try:
+            response = route(conn, request)
+        except Exception as exc:  # noqa: BLE001 — веб не роняет сбор новостей [CORE-017]
+            # Раньше сбой страницы попадал в тот же `except`, что и разбор
+            # запроса, и человек получал пустой 400 вместо объяснения. Теперь
+            # ошибка страницы — это 500 и запись в журнал с адресом.
+            log.warning("страница %s не отдалась: %s: %s", request.path,
+                        type(exc).__name__, exc, exc_info=True)
+            response = Response(pages.oops("Что-то сломалось. Подробности в журнале службы."),
+                                status="500 Internal Server Error")
     try:
         writer.write(response.raw())
         await writer.drain()
+    except ConnectionError:
+        pass
     finally:
         writer.close()
 
@@ -434,5 +494,5 @@ if __name__ == "__main__":
 
 __all__ = ("COOKIE", "DEFAULT_HOST", "DEFAULT_PORT", "Request", "Response",
            "base_url", "code_for", "cookie_value", "csrf", "handle", "host", "new_session",
-           "parse", "main", "port", "redeem", "redirect", "route", "safe_back", "serve",
+           "parse", "main", "port", "read_body", "redeem", "redirect", "route", "safe_back", "serve",
            "theme_cookie", "theme_of", "whoami")
