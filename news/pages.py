@@ -83,6 +83,11 @@ del { background:var(--del-bg); color:var(--del-ink) }
 ins { background:var(--ins-bg); color:var(--ins-ink); text-decoration:none }
 .снято { color:var(--bad); font-weight:600 }
 .метка { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--mut) }
+.строка-полей { display:flex; gap:.5rem; flex-wrap:wrap; align-items:center;
+                margin-bottom:.5rem }
+.издания { display:flex; gap:.4rem .9rem; flex-wrap:wrap; font-size:13px;
+           color:var(--mut); border-top:1px solid var(--hair); padding-top:8px }
+label { font-size:13.5px }
 code, .ровно { font-family:ui-monospace, Menlo, Consolas, monospace; font-size:12.5px }
 """
 
@@ -90,7 +95,8 @@ code, .ровно { font-family:ui-monospace, Menlo, Consolas, monospace; font-s
 MENU = (
     ("Наблюдение", (
         ("/", "Темы"),
-        ("/новости", "Последние"),
+        ("/лента", "Общая лента"),
+        ("/новости", "Пришло вам"),
         ("/поиск", "Поиск по архиву"),
         ("/правки", "Правки и снятия"),
         ("/задержки", "Задержки"),
@@ -326,6 +332,115 @@ def _found_row(row: dict[str, Any]) -> str:
         url=html.escape(str(row["url"] or "")),
         tail=tail,
     )
+
+
+def _stream_form(conn: Any, user_id: int, flt: Any) -> str:
+    """Форма отбора ленты. Обычный GET: ссылку можно сохранить и переслать."""
+    from . import sources as sources_module  # noqa: PLC0415
+    from . import stream  # noqa: PLC0415
+
+    издания = "".join(
+        '<label><input type=checkbox name=издание value="{code}"{on}> {name}</label>'.format(
+            code=html.escape(code), name=label(code),
+            on=" checked" if code in flt.sources else "")
+        for code in sorted(sources_module.BY_CODE)
+    )
+    темы = "".join(
+        '<option value="{id}"{on}>{title}</option>'.format(
+            id=int(topic["id"]), title=html.escape(str(topic["title"])),
+            on=" selected" if int(topic["id"]) == flt.topic_id else "")
+        for topic in store.topics_of(conn, user_id)
+    )
+    выбор = lambda name, values, current: (  # noqa: E731
+        '<select name="{name}">{options}</select>'.format(
+            name=name,
+            options="".join(
+                '<option value="{v}"{on}>{v}</option>'.format(
+                    v=html.escape(str(value)), on=" selected" if value == current else "")
+                for value in values),
+        )
+    )
+    return (
+        '<form method=get action="/лента"><div class=панель>'
+        '<div class=строка-полей>'
+        '<input type=text name=q value="{q}" placeholder="слова: тариф, подрядчик">'
+        '{период} {порядок} {папки}'
+        '<select name=тема><option value="">любая тема</option>{темы}</select>'
+        '<label><input type=checkbox name=оригиналы value=1{ориг}> только оригиналы</label>'
+        "</div>"
+        '<div class=строка-полей>с <input type=text name="с" value="{с}" size=10 '
+        'placeholder="2026-09-01"> по <input type=text name="по" value="{по}" size=10 '
+        'placeholder="2026-09-25"><button>Показать</button></div>'
+        "<div class=издания>{издания}</div></div></form>"
+    ).format(
+        q=html.escape(flt.words, quote=True),
+        период=выбор("период", [name for name, _ in stream.PERIODS], flt.period),
+        порядок=выбор("порядок", list(stream.SORTS), flt.sort),
+        папки=выбор("папки", list(stream.GROUPS), flt.group),
+        темы=темы,
+        ориг=" checked" if flt.only_original else "",
+        **{"с": html.escape(flt.since, quote=True), "по": html.escape(flt.until, quote=True)},
+        издания=издания,
+    )
+
+
+def _stream_row(row: dict[str, Any]) -> str:
+    marks = []
+    if row.get("перепечатка_из"):
+        marks.append('<a href="/сюжет?id={}">перепечатка</a>'.format(int(row["id"])))
+    if row.get("правок"):
+        marks.append("правок: {}".format(int(row["правок"])))
+    if row.get("снято"):
+        marks.append('<span class=снято>снято</span>')
+    tail = (" · " + " · ".join(marks)) if marks else ""
+    return (
+        '<li><a href="/материал?id={id}">{title}</a><br>'
+        '<span class=тихо>{source} · {when} · '
+        '<a href="{url}" rel="noreferrer">оригинал</a>{tail}</span></li>'
+    ).format(
+        id=int(row["id"]),
+        title=html.escape(str(row["заголовок"] or "без заголовка")),
+        source=label(row["источник"]),
+        when=when(row["опубликовано"] or row["замечено"]),
+        url=html.escape(str(row["url"] or "")),
+        tail=tail,
+    )
+
+
+def stream_page(conn: Any, user_id: int, query: dict[str, str], theme: str = "система",
+                many: Any = None) -> str:
+    """Общая лента: что вообще вышло, с отбором и раскладкой по папкам.
+
+    Это не «пришло вам»: здесь весь собранный выход, включая то, что не
+    попало ни в одну тему. Пустая лента означает, что мы ничего не видели за
+    этот период, а не что изданий не было [NEWS-001].
+    """
+    from . import stream  # noqa: PLC0415
+
+    flt = stream.read(query, many)
+    rows = stream.select(conn, flt)
+    ещё = len(rows) > stream.PER_PAGE
+    rows = rows[:stream.PER_PAGE]
+    куски = [_stream_form(conn, user_id, flt)]
+    if not rows:
+        куски.append("<p class=тихо>За этот период мы ничего такого не видели. "
+                     "Это не значит, что ничего не выходило [NEWS-001].</p>")
+    else:
+        куски.append('<p class=тихо>Строк на странице: {}{}</p>'.format(
+            len(rows), ", есть ещё" if ещё else ""))
+        for name, group in stream.folders(conn, rows, flt, user_id):
+            if name:
+                куски.append("<h2>{} — {}</h2>".format(html.escape(name), len(group)))
+            куски.append("<ul>{}</ul>".format(
+                "".join(_stream_row(row) for row in group)))
+    шаги = []
+    if flt.page > 1:
+        шаги.append('<a href="{}">назад</a>'.format(stream.link(flt, стр=flt.page - 1)))
+    if ещё:
+        шаги.append('<a href="{}">дальше</a>'.format(stream.link(flt, стр=flt.page + 1)))
+    if шаги:
+        куски.append("<p>{}</p>".format(" · ".join(шаги)))
+    return page("Общая лента", "".join(куски), theme, "/лента")
 
 
 def search_page(conn: Any, query: dict[str, str], theme: str = "система") -> str:
@@ -586,11 +701,74 @@ def telegram_page(conn: Any, user_id: int, mark: str, theme: str = "систем
     ).format(mark=mark, boxes=boxes,
              since=html.escape(str(row["quiet_from"] if row else "") or "", quote=True),
              until=html.escape(str(row["quiet_to"] if row else "") or "", quote=True))
-    return page("Отдача в Telegram", form +
+    return page("Отдача в Telegram",
+                "<h2>Виды сообщений и тишина</h2>" + form +
                 "<p class=тихо>Виды: «сырое» — первое сообщение по заголовку, «дополнение» — "
                 "когда приехал текст, «изменение» — правка или снятие, «тоже_написали» — "
-                "перепечатка, «запрос» — находка по сохранённому запросу.</p>",
+                "перепечатка, «запрос» — находка по сохранённому запросу.</p>" +
+                _sources_form(conn, user_id, mark) + _topics_form(conn, user_id, mark),
                 theme, "/телеграм")
+
+
+def _sources_form(conn: Any, user_id: int, mark: str) -> str:
+    """Из каких изданий вообще слать. Ничего не отмечено — значит из всех."""
+    from . import sources as sources_module  # noqa: PLC0415
+
+    chosen = store.user_sources(conn, user_id)
+    boxes = "".join(
+        '<label><input type=checkbox name=издание value="{code}"{on}> {name}</label>'.format(
+            code=html.escape(code), name=label(code),
+            on=" checked" if (not chosen or code in chosen) else "")
+        for code in sorted(sources_module.BY_CODE)
+    )
+    return (
+        "<h2>Издания в отдаче</h2>"
+        '<form method=post action="/телеграм/издания">'
+        '<input type=hidden name=метка value="{mark}">'
+        "<div class=панель><div class=издания>{boxes}</div></div>"
+        "<button>Сохранить издания</button></form>"
+        "<p class=тихо>Это фильтр отдачи, а не сбора: выключенное здесь издание всё равно "
+        "собирается и остаётся в архиве и в общей ленте. Чтобы не опрашивать его вовсе — "
+        "страница «Источники».</p>"
+    ).format(mark=mark, boxes=boxes)
+
+
+def _topics_form(conn: Any, user_id: int, mark: str) -> str:
+    """Какие темы отдавать в бот и из каких изданий каждую."""
+    from . import sources as sources_module  # noqa: PLC0415
+
+    mine = store.topics_of(conn, user_id)
+    if not mine:
+        return ("<h2>Темы в отдаче</h2><p class=тихо>Тем пока нет. "
+                'Заведите первую на странице <a href="/">Темы</a>.</p>')
+    строки = []
+    for topic in mine:
+        codes = {code.strip() for code in str(topic["sources"] or "").split(",") if code.strip()}
+        boxes = "".join(
+            '<label><input type=checkbox name=издание value="{code}"{on}> {name}</label>'.format(
+                code=html.escape(code), name=label(code),
+                on=" checked" if (not codes or code in codes) else "")
+            for code in sorted(sources_module.BY_CODE)
+        )
+        строки.append(
+            '<form method=post action="/телеграм/тема"><div class=панель>'
+            '<input type=hidden name=метка value="{mark}">'
+            '<input type=hidden name=номер value="{id}">'
+            '<div class=строка-полей><b>{title}</b>'
+            '<span class=тихо>{words}</span>'
+            '<label><input type=checkbox name=отдавать value=1{on}> отдавать в бот</label>'
+            "<button class=тихо>Сохранить</button></div>"
+            "<div class=издания>{boxes}</div></div></form>".format(
+                mark=mark, id=int(topic["id"]),
+                title=html.escape(str(topic["title"])),
+                words=html.escape(str(topic["words"] or "")),
+                on=" checked" if topic["enabled"] else "", boxes=boxes,
+            )
+        )
+    return ("<h2>Темы в отдаче</h2>" + "".join(строки) +
+            "<p class=тихо>Выключенная тема перестаёт слать сообщения, но остаётся темой: "
+            "её слова по-прежнему раскладывают общую ленту по папкам. Ни одно издание "
+            "не отмечено — значит все.</p>")
 
 
 def queries_page(conn: Any, user_id: int, mark: str, theme: str = "система") -> str:
@@ -695,6 +873,7 @@ def link_message(url: str) -> str:
 
 
 __all__ = ("MENU", "PER_PAGE", "STYLE", "THEMES", "changes_page", "copy_page", "feed",
+           "stream_page",
            "home", "item_page", "label", "lag", "latency", "link_message", "login", "oops",
            "page", "queries_page", "search_page", "sidebar", "sources_page", "story_page",
            "telegram_page", "theme_class", "when")
