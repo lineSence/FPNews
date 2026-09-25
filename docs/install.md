@@ -1,233 +1,53 @@
-# Установка на сервер и проверка через SSH-туннель
+# Установка и деплой FPNews
 
-Сервер: один процессор, гигабайт памяти, из которого свободно около 500 МБ,
-рядом уже работают другие сервисы. Отсюда весь стиль установки: без Docker,
-без Redis, без Postgres, одна виртуальная среда и один процесс под systemd.
-
-## 1. Что поставить в систему
+## Локально
 
 ```bash
-sudo apt update
-sudo apt install -y python3 python3-venv git sqlite3
-python3 -V   # нужен 3.11 или новее
+git clone git@github.com:lineSence/FPNews.git
+cd FPNews
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
 ```
 
-## 2. Пользователь и папки
+Заполнить в `.env` как минимум `TELEGRAM_BOT_TOKEN`, при необходимости — параметры LLM и эмбеддингов. База создаётся сама в `data/fpnews.sqlite3`.
 
-Раскладка такая: дом пользователя `/opt/fpnews`, код в подпапке `app`, а база
-и секреты рядом с ним, но **вне репозитория** — тогда `git pull` их не трогает.
+Проверка источников без записи в базу:
 
 ```bash
-sudo useradd --system --home /opt/fpnews --shell /usr/sbin/nologin fpnews
-sudo mkdir -p /opt/fpnews/.ssh /opt/fpnews/data
-sudo chown -R fpnews: /opt/fpnews
-sudo chmod 700 /opt/fpnews/.ssh
+python -m news.probe
 ```
 
-Каждая команда `sudo -u fpnews` дальше идёт с `env HOME=/opt/fpnews`: без этого
-git и ssh полезут в `/root` и получат отказ по правам.
+## Сервер
 
-## 3. Доступ к приватному репозиторию
-
-Ключ развёртывания: он даёт доступ только к этому репозиторию и только на
-чтение — в отличие от личного токена, который открывает всё сразу.
+Ориентир: одно ядро, 500 МБ памяти. Каталог `/opt/fpnews`.
 
 ```bash
-sudo -u fpnews env HOME=/opt/fpnews ssh-keygen -t ed25519 -N '' \
-  -f /opt/fpnews/.ssh/id_ed25519 -C 'fpnews@vps'
-sudo cat /opt/fpnews/.ssh/id_ed25519.pub
+sudo mkdir -p /opt/fpnews
+sudo chown $USER /opt/fpnews
+git clone git@github.com:lineSence/FPNews.git /opt/fpnews
+cd /opt/fpnews
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt
+cp .env.example .env
 ```
 
-Показанную строку добавить на <https://github.com/lineSence/FPNews/settings/keys>
-→ Add deploy key, галочку «Allow write access» **не** ставить. Затем:
+Юнит systemd лежит в `deploy/fpnews.service` (`WorkingDirectory=/opt/fpnews`, `ExecStart=python -m news.run`, `MemoryMax=320M`):
 
 ```bash
-sudo -u fpnews env HOME=/opt/fpnews \
-  git clone git@github.com:lineSence/FPNews.git /opt/fpnews/app
-```
-
-Первый раз ssh спросит про отпечаток github.com — ответить `yes`.
-
-## 4. Среда и секреты
-
-```bash
-cd /opt/fpnews/app
-sudo -u fpnews env HOME=/opt/fpnews python3 -m venv .venv
-sudo -u fpnews .venv/bin/pip install -U pip
-sudo -u fpnews .venv/bin/pip install -r requirements-news.txt
-
-printf 'TELEGRAM_BOT_TOKEN=%s\n' 'сюда_токен' | sudo -u fpnews tee /opt/fpnews/.env
-sudo chmod 600 /opt/fpnews/.env
-```
-
-Кнопки под новостями (выжимка, цитата, оценка) ходят в локальный LiteLLM.
-Пока его нет, кнопки отвечают «не получилось», всё остальное работает. Когда
-появится, в тот же `.env` добавляются четыре строки:
-
-```
-FPNEWS_LLM_URL=http://127.0.0.1:4000/v1
-FPNEWS_LLM_KEY=ключ_шлюза
-FPNEWS_LLM_MODELS=gemini-flash, groq-llama, local
-FPNEWS_LLM_MAX_CALLS=200
-```
-
-Смысловая склейка сюжетов берёт векторы оттуда же:
-
-```
-FPNEWS_EMBED_MODEL=text-embedding-004
-FPNEWS_EMBED_MAX_CALLS=2000
-FPNEWS_STORY_THRESHOLD=0.86
-```
-
-Имя модели векторов менять нельзя без очистки таблицы `vectors`: векторы
-разных моделей несравнимы `[NEWS-009]`. Порог `0.86` — осторожная начальная
-оценка; поднимать или опускать его следует по журналу, где видны пары
-«близко, но не склеиваем».
-
-`FPNEWS_LLM_MODELS` — каскад по порядку: первая отвечающая и выигрывает,
-выбывшая после 429 или 404 не спрашивается до конца суток. `MAX_CALLS` —
-потолок вызовов в сутки на весь бот.
-
-Токен нигде больше не хранится и в репозиторий не попадает `[CORE-012]`.
-Бота заводит @BotFather; домен для будущего входа в веб привязывается
-командой `/setdomain` → `mousehousespb.online`.
-
-## 5. Проверка до запуска службы
-
-Всё это безопасно гонять руками — ни одно из действий ничего не рассылает.
-
-```bash
-cd /opt/fpnews/app
-sudo -u fpnews .venv/bin/python -m news.probe                 # обе двери, один заход
-sudo -u fpnews .venv/bin/python -m news.probe fontanka -n 20 -e 15
-```
-
-Второй прогон — главный: двадцать заходов раз в пятнадцать секунд показывают,
-как ведёт себя ddos-guard именно с вашего адреса. Смотреть на `отказов` и
-`коды` в итоговой сводке. Если появятся 403 — интервал увеличится сам
-`[NEWS-006]`, а в `docs/news-sources.md` надо будет записать новую цифру.
-
-## 6. Служба
-
-```bash
-sudo cp /opt/fpnews/app/deploy/fpnews.service /etc/systemd/system/
+sudo cp deploy/fpnews.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now fpnews
-systemctl status fpnews
 journalctl -u fpnews -f
 ```
 
-В журнале при старте видно: «холодный старт, подобрано N — не считаем и не
-шлём». Это правильно: лента на момент запуска — не новости.
+## Веб
 
-Обновление после изменений в репозитории:
+По умолчанию веб слушает `127.0.0.1:6769`. Для публичного доступа: обратный прокси (Caddy) на домен, `FPNEWS_WEB_URL=https://<домен>`, `FPNEWS_WEB_SECURE=1`.
 
-```bash
-sudo -u fpnews env HOME=/opt/fpnews git -C /opt/fpnews/app pull
-sudo systemctl restart fpnews
-```
-
-## 7. Проверка через SSH-туннель
-
-Телеграму туннель не нужен: бот сам ходит наружу. Туннель нужен, чтобы
-смотреть на внутренности сервера, не открывая ни одного порта в интернет.
-
-**Порт под веб-интерфейс (появится на шаге 7).** Сервис будет слушать только
-`127.0.0.1:6769`, а вы пробрасываете его к себе:
+## Обновление
 
 ```bash
-ssh -N -L 6769:127.0.0.1:6769 root@ВАШ_СЕРВЕР
-# в браузере: http://127.0.0.1:6769
+cd /opt/fpnews && git pull && .venv/bin/pip install -r requirements.txt && sudo systemctl restart fpnews
 ```
-
-**Пока веба нет — три полезные команды по SSH:**
-
-```bash
-# как быстро доходят новости
-ssh root@ВАШ_СЕРВЕР 'cd /opt/fpnews && PYTHONPATH=app app/.venv/bin/python -m news.run --latency'
-
-# что вообще собралось за последний час
-ssh root@ВАШ_СЕРВЕР "sqlite3 /opt/fpnews/data/fpnews.sqlite3 \
-  \"SELECT source, datetime(listed_at), substr(title,1,60) FROM items \
-    WHERE listed_at > datetime('now','-1 hour') ORDER BY id DESC LIMIT 20\""
-
-# живой журнал
-ssh root@ВАШ_СЕРВЕР 'journalctl -u fpnews -f'
-```
-
-**Копия базы к себе.** Копировать файл на ходу нельзя: рядом лежит журнал WAL,
-и получится битый снимок. Правильно так:
-
-```bash
-ssh root@ВАШ_СЕРВЕР "sqlite3 /opt/fpnews/data/fpnews.sqlite3 \
-  \".backup '/tmp/fpnews-copy.sqlite3'\""
-scp root@ВАШ_СЕРВЕР:/tmp/fpnews-copy.sqlite3 .
-```
-
-## 8. Сценарий первой проверки целиком
-
-1. `systemctl status fpnews` — служба работает, в журнале холодный старт.
-2. В Telegram: `/старт`, затем `/добавить` со словами, которые точно встретятся
-   сегодня («петербург, суд, метро»).
-3. Ждать. Медуза публикует несколько материалов в час, Фонтанка чаще.
-4. Пришло сообщение — посмотреть `/задержка`: там медиана и девяностый
-   процентиль по трём участкам пути.
-5. Через сутки повторить: цифры одного дня — ещё не измерение `[CORE-019]`.
-
-## 8а. Веб-интерфейс на localhost
-
-Он поднимается вместе со службой на `127.0.0.1:6769` и наружу не смотрит.
-Настройки — те же `.env`:
-
-```
-FPNEWS_WEB=1                       # 0 — не поднимать вовсе
-FPNEWS_WEB_HOST=127.0.0.1
-FPNEWS_WEB_PORT=6769
-FPNEWS_WEB_URL=http://localhost:6769   # что бот пишет в ссылке /вход
-```
-
-Со своей машины интерфейс открывается пробросом порта — сертификат и домен
-для этого не нужны:
-
-```bash
-ssh -N -L 6769:127.0.0.1:6769 пользователь@сервер
-# в браузере: http://localhost:6769
-```
-
-Вход: напишите боту `/вход`, он пришлёт ссылку на пять минут и одно
-использование `[NEWS-011]`. Без бота ссылку можно получить руками:
-
-```bash
-sudo -u fpnews env HOME=/opt/fpnews .venv/bin/python -m news.web \
-  --db /opt/fpnews/data/fpnews.sqlite3 --вход ВАШ_ID_В_TELEGRAM
-```
-
-Веб можно гонять и отдельно от сторожей — удобно, пока правится разметка:
-
-```bash
-python -m news.web --db /opt/fpnews/data/fpnews.sqlite3
-```
-
-Когда интерфейс обкатан, наружу его выводит Caddy на `mousehousespb.online`
-(автоматический сертификат), а в `.env` добавляется `FPNEWS_WEB_SECURE=1`,
-чтобы кука сессии уходила только по HTTPS. До этого момента порт остаётся
-закрытым — это не временное упрощение, а осознанный порядок: сначала
-обкатать, потом открыть.
-
-## 9. Если что-то не так
-
-| Симптом | Где смотреть |
-|---|---|
-| Служба перезапускается | `journalctl -u fpnews -n 100`; при упоминании памяти поднять `MemoryMax` |
-| Новостей нет совсем | `news.probe` — жива ли дверь; в журнале коды ответов |
-| Сообщения не приходят | токен в `.env`, в журнале «TELEGRAM_BOT_TOKEN не задан» |
-| Фонтанка отдаёт 403 | защита заметила частоту; увеличить `interval` источника в `news/sources.py` |
-| `Permission denied` при `sudo -u fpnews` | забыт `env HOME=/opt/fpnews` |
-| Кнопка отвечает «не получилось» | жив ли LiteLLM: `curl -s localhost:4000/v1/models`; причина отказа — в журнале строкой «модель не ответила» |
-| Приходят двойные сообщения об одном событии | порог склейки высок: в журнале строки «близко, но не склеиваем» с числом — опустить `FPNEWS_STORY_THRESHOLD` до него |
-| Разные новости склеились в одну | наоборот, порог поднять; склейка видна по `dup_of` в базе |
-| Досылок «изменение в новости» нет | перечитывание идёт только сутки и только по разосланным: `SELECT checks, checked_at FROM items WHERE sent_at IS NOT NULL` |
-| Веб не открывается через туннель | в журнале строка «веб слушает»; порт занят — сменить `FPNEWS_WEB_PORT` |
-| Ссылка входа не работает | она живёт пять минут и один раз: попросите у бота новую |
-| Кнопки молчат вовсе | в журнале «дневной бюджет вызовов исчерпан» — поднять `FPNEWS_LLM_MAX_CALLS` |
-| База растёт | `sqlite3 ... "SELECT COUNT(*) FROM items"`; чистка старого появится вместе с обогащением |

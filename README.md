@@ -1,123 +1,58 @@
-# FuckHR
+# FPNews
 
-**Personal Labour Market Intelligence Agent** — агентная система мониторинга рынка труда для соискателя.
+Агрегатор петербургских новостей: собирает публикации семи изданий, ищет повторы и сюжеты, отдаёт ленту в Telegram и в веб-интерфейс.
 
-## Зачем это
+Проект выделен из родительского репозитория FuckHR. Код FuckHR сохранён в ветке `legacy` — оттуда берём куски кода, если что-то нужно перенести. В `main` остаётся только FPNews.
 
-Фоновый прогон собирает вакансии, отсеивает HR-клише, проверяет работодателя по отзывам и
-истории публикаций и присылает карточки в Telegram. Управление — локальный веб-интерфейс.
+## Что умеет
 
-## Ключевая ценность
+- Опрос источников: Meduza, Фонтанка, Интерфакс, Деловой Петербург, РИА, Мойка78, Бумага (коды: `meduza`, `fontanka`, `interfax`, `dp`, `ria`, `moika78`, `paper`).
+- Дедупликация по simhash, склейка публикаций в сюжеты, отслеживание правок материалов (ревизии).
+- Обогащение текста и эмбеддинги через внешний LLM-эндпоинт (опционально, с лимитом вызовов).
+- Доставка в Telegram: сырое, дополнение, изменение, тоже_написали.
+- Веб-интерфейс без JavaScript: вход по коду, лента, задержки, темы.
 
-Не поиск вакансий (там конкуренция с hh.ru проиграна заранее), а **проверка правдивости работодателя до отклика**:
-сопоставление обещаний вакансии с внешними данными.
+## Установка
 
-> «Дружная команда» → 23 упоминания переработок в отзывах → вакансия публиковалась 5 раз за 8 месяцев →
-> вывод: «утверждение о стабильной команде не подтверждается найденными данными».
-
-Отзывы, похожие на заказные, в оценку не идут, а сама накрутка — отдельный сигнал о компании
-(`docs/fake-reviews.md`).
-
-Зарплата вакансии сравнивается с медианой похожих вакансий из собственных наблюдений за полгода:
-«ниже рынка» и «вилки нет почти нигде» — такие же факты о работодателе, как переработки
-(`docs/market-salary.md`).
-
-Метрика успеха — не «500 откликов в день», а **«5 вакансий с полным досье»**.
-
-## Статус
-
-Работает. Прогон `run.py` доходит от сбора до карточек, интерфейс `webui.py` запускает задачи и правит настройки,
-тесты идут без единого сетевого вызова (`docs/testing.md`).
-
-```powershell
-.venv\Scripts\python webui.py            # http://127.0.0.1:8765
-.venv\Scripts\python run.py --dry-run    # один прогон без записи и без Telegram
-.venv\Scripts\python -m pytest -q        # тесты
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
 ```
 
-## Стек — фактический
+Подробности и деплой: `docs/install.md`, юнит systemd — `deploy/fpnews.service`.
 
-```txt
-Task Scheduler (pythonw.exe)
-        ↓
-run.py — один прогон, последовательный, без оркестратора
-        ↓
-hh.ru (HTML поиска, ADR-015) + SuperJob, Работа России, Zarplata.ru, Работа.ру
-        ↓                      (docs/sources.md, галочки на главной)
-                     score.py → db.py (SQLite)
-        ↓                                      ↓
-  detector.py (история публикаций)      dossier.py + websearch.py + reviewpage.py
-                                       + fake_reviews.py (накрученные отзывы)
-        ↓                                      ↓
-                     bot.py → Telegram
+## Команды
+
+```bash
+python -m news.run                 # цикл сбора и доставки
+python -m news.run meduza fontanka # только указанные источники
+python -m news.run -n 20           # ограничить число материалов
+python -m news.run --diag          # диагностика шагов
+python -m news.run --latency       # замеры задержек
+python -m news.probe               # проверка источников (-n, -e, --fallback)
+python -m news.web --вход          # веб-интерфейс
 ```
 
-Зависимости: `httpx`, `pydantic`, `PyYAML`, `rapidfuzz`, `aiogram`, `python-dotenv`, `dnspython`.
-Всё остальное — стандартная библиотека, включая веб-интерфейс на `http.server`.
+## Структура
 
-Модели идут через собственный шлюз `llm.py`: локальный адрес (FreeLLMAPI / Ollama) и
-необязательный внешний прокси LiteLLM (ADR-005, ADR-017). Этапы `contacts`, `dossier`,
-`draft` и `review_fake` остаются локальными, пока владелец явно не разрешит обратное
-(`llm_profiles.PERSONAL_STAGES`, `[CORE-012]`).
+```
+news/        код проекта (fetch, article, dedup, story, enrich, embed, store, deliver, telegram, bot, web, pages, topics, watch, probe, recheck, run, sources, model)
+diag.py      общая диагностика (используется news.run, news.probe, news.watch)
+docs/        документация FPNews
+tests/       тесты (pytest -q)
+deploy/      systemd-юнит
+wiki/rules/  правила проекта
+```
 
-Этапов двенадцать (`llm_profiles.STAGE_PROFILES`), каждый ходит по своему профилю
-(`FAST`, `SMART`, `LONG`) и может иметь своё имя модели. Сравнить модели на своих же
-данных — `bench.py` и страница «Модель» (`docs/model-bench.md`).
+## Данные
 
-Модель зовут не всегда и не на всё:
+SQLite в `data/fpnews.sqlite3` (WAL). Схема описана в `docs/news-schema.md`.
 
-- векторы считает `bge-m3` через тот же шлюз, на них живёт близость к профилю и поиск
-  похожего (`embeddings.py`, `docs/embeddings.md`);
-- гейт `GATE_PROFILE_MIN` пропускает этап, когда вакансия далека от профиля
-  (`stage_gates.py`, `docs/gates.md`), `[CORE-016]`;
-- условия работы умеет размечать спанами GLiNER вместо генерации — цитата тогда
-  дословна по построению (`extract_spans.py`, зависимость необязательная);
-- разметка своих же прогонов выгружается в датасет для дообучения
-  (`dataset_export.py`, `docs/dataset.md`).
+## Тесты
 
-Без модели прогон доходит до конца — беднее деталями, но полностью (`[CORE-015]`, `[CORE-017]`).
-
-## Чего в коде нет, хотя оно есть в ранних ADR
-
-| Что | Статус |
-|---|---|
-| LangGraph + checkpoint (ADR-007) | не внедрено: паузы на подтверждение в пайплайне нет, письма готовит `outreach.py` по явной команде |
-| hh.ru Open API (ADR-003) | заменено на разбор HTML: публичный `GET /vacancies` с апреля 2026 отдаёт 403 (ADR-015) |
-| `sqlite-vec` (ADR-008) | не внедрено: векторы есть (`embeddings.py`, `bge-m3`, свои таблицы и косинус на чистом Python), но индекса нет — базе в тысячи вакансий он не нужен |
-| семантический дедуп вакансий (ADR-008) | не внедрено: дедуп по ключу `(company_norm, title_norm)`. Векторы показывают похожие вакансии и ловят дубли отзывов, но ключ дедупа не трогают |
-| `instructor`, structured output | не внедрено: ответы модели разбираются вручную в `llm_tasks.py` |
-| Playwright, карьерные страницы | не внедрено: страницы отзывов читаются обычным HTTP (`reviewpage.py`) |
-| systemd timers | заменено на Task Scheduler: система живёт на Windows (ADR-014) |
-
-## Структура документации
-
-Документация организована по концепции **Self-Evolving Knowledge (SEK)**: знания разделены по уровням контекста,
-грузится только то, что нужно для текущей задачи.
-
-| Уровень | Что это | Где лежит |
-| --- | --- | --- |
-| L0 — Bootstrap | Сжатая инструкция агента и Critical Rules | [`AGENTS.md`](./AGENTS.md) |
-| L1 — Routing & Index | `keywords → files` и оглавление | [`wiki/_routing.md`](./wiki/_routing.md), [`wiki/_index.md`](./wiki/_index.md) |
-| L2 — Validated | Правила, справочники, архитектура, процессы | [`wiki/`](./wiki) |
-| L3 — Ephemeral | Конвейер черновых наблюдений агента | [`memory/inbox.md`](./memory/inbox.md) |
-
-Жизненный цикл знания: `draft → validated → core`, см. [`docs/knowledge-lifecycle.md`](./docs/knowledge-lifecycle.md).
-
-## Документы
-
-- [`INSTALL.md`](./INSTALL.md) — установка и первый запуск
-- [`docs/architecture.md`](./docs/architecture.md) — как устроено на самом деле
-- [`docs/roadmap.md`](./docs/roadmap.md) — что сделано и что дальше
-- [`docs/testing.md`](./docs/testing.md) — тесты
-- [`docs/detector.md`](./docs/detector.md) — детектор HR-брехни
-- [`docs/market-salary.md`](./docs/market-salary.md) — рынок зарплат и метки отклонений
-- [`docs/review-quality.md`](./docs/review-quality.md) — легитимность отзывов и проверка разбора
-- [`docs/ai-text.md`](./docs/ai-text.md) — признаки сгенерированного текста
-- [`docs/contacts.md`](./docs/contacts.md) — поиск контактов и письма
-- [`docs/knowledge-lifecycle.md`](./docs/knowledge-lifecycle.md) — как растут знания агента
-- [`docs/profiles.md`](./docs/profiles.md) — несколько профилей поиска
-- [`docs/targets.md`](./docs/targets.md) — цели: изучить выбранную компанию целиком
-- [`docs/performance.md`](./docs/performance.md) — где прогон теряет время (аудит, B-15)
-- [`docs/crawling.md`](./docs/crawling.md) — сбор из сети: фетчер против кроулера, robots.txt, чего нет
-- [`docs/spinoffs.md`](./docs/spinoffs.md) — что можно собрать из кусков проекта
-- [`docs/contributing.md`](./docs/contributing.md) — как вести код и документацию
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+```
