@@ -117,6 +117,34 @@ SCHEMA = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS snapshots (
+        id       INTEGER PRIMARY KEY,
+        item_id  INTEGER NOT NULL,
+        taken_at TEXT NOT NULL,              -- когда страница была у нас в руках
+        sha256   TEXT NOT NULL,              -- отпечаток исходного HTML
+        size     INTEGER NOT NULL DEFAULT 0, -- размер до сжатия
+        packed   BLOB NOT NULL,              -- сам HTML, gzip
+        UNIQUE(item_id, sha256)              -- одинаковая страница хранится один раз
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS snapshots_item ON snapshots(item_id, taken_at)",
+    """
+    CREATE TABLE IF NOT EXISTS saved_queries (
+        id            INTEGER PRIMARY KEY,
+        user_id       INTEGER NOT NULL,
+        title         TEXT NOT NULL DEFAULT '',
+        query         TEXT NOT NULL,
+        source        TEXT NOT NULL DEFAULT '',   -- код издания; пусто — все
+        topic_id      INTEGER,
+        only_original INTEGER NOT NULL DEFAULT 0,
+        only_revised  INTEGER NOT NULL DEFAULT 0,
+        notify        INTEGER NOT NULL DEFAULT 1, -- слать ли находки в бот
+        last_item_id  INTEGER NOT NULL DEFAULT 0, -- по какой id уже отдано
+        created_at    TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS saved_queries_user ON saved_queries(user_id)",
+    """
     CREATE TABLE IF NOT EXISTS enrichments (
         item_id    INTEGER NOT NULL,
         kind       TEXT NOT NULL,              -- выжимка | цитата | оценка
@@ -150,6 +178,11 @@ def connect(path: str | Path = DEFAULT_PATH) -> sqlite3.Connection:
 LATE_COLUMNS = (
     ("items", "checked_at", "TEXT"),
     ("items", "checks", "INTEGER NOT NULL DEFAULT 0"),
+    # Шаг 10: текст ревизии (раньше хранился только отпечаток) и снятие с
+    # публикации. Обе колонки нужны на базах, которые уже работают на сервере.
+    ("item_revisions", "text", "TEXT NOT NULL DEFAULT ''"),
+    ("items", "gone_at", "TEXT"),
+    ("items", "gone_code", "INTEGER"),
 )
 
 
@@ -365,14 +398,29 @@ def neighbours(conn: sqlite3.Connection, item_id: int, model: str,
 
 
 def revise(conn: sqlite3.Connection, item_id: int, title: str, length: int,
-           digest: str) -> None:
-    """Запись о том, как материал выглядел в этот момент."""
+           digest: str, text: str = "") -> None:
+    """Запись о том, как материал выглядел в этот момент.
+
+    С шага 10 храним и сам текст: отпечаток отвечает «изменилось», но не
+    отвечает «что именно», а исчезнувшая формулировка и есть наблюдение
+    [NEWS-008]. Пустой текст не затирает уже сохранённый.
+    """
     conn.execute(
-        "INSERT INTO item_revisions(item_id, seen_at, title, length, digest) "
-        "VALUES(?,?,?,?,?)",
-        (item_id, now(), title, int(length), digest),
+        "INSERT INTO item_revisions(item_id, seen_at, title, length, digest, text) "
+        "VALUES(?,?,?,?,?,?)",
+        (item_id, now(), title, int(length), digest, text or ""),
     )
     conn.commit()
+
+
+def revisions(conn: sqlite3.Connection, item_id: int, limit: int = 50) -> list[dict[str, Any]]:
+    """История правок материала от старой к новой, вместе с текстами."""
+    rows = conn.execute(
+        "SELECT id, seen_at, title, length, digest, text FROM item_revisions "
+        "WHERE item_id = ? ORDER BY id ASC LIMIT ?",
+        (item_id, int(limit)),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def last_revision(conn: sqlite3.Connection, item_id: int) -> dict[str, Any] | None:
@@ -384,6 +432,128 @@ def last_revision(conn: sqlite3.Connection, item_id: int) -> dict[str, Any] | No
     return dict(row) if row is not None else None
 
 
+def save_snapshot(conn: sqlite3.Connection, item_id: int, page: str) -> str:
+    """Доказательная копия страницы: gzip плюс sha256. Возвращает отпечаток.
+
+    Пересказ проверить нельзя, а копию — можно: издание снимает материал, а у
+    нас остаётся то, что мы видели своими глазами, со временем получения
+    [NEWS-007]. Одинаковая страница второй раз не пишется.
+    """
+    import gzip  # noqa: PLC0415 — нужен только здесь
+    import hashlib  # noqa: PLC0415
+
+    raw = (page or "").encode("utf-8", "replace")
+    if not raw:
+        return ""
+    digest = hashlib.sha256(raw).hexdigest()
+    conn.execute(
+        "INSERT OR IGNORE INTO snapshots(item_id, taken_at, sha256, size, packed) "
+        "VALUES(?,?,?,?,?)",
+        (item_id, now(), digest, len(raw), gzip.compress(raw, 6)),
+    )
+    conn.commit()
+    return digest
+
+
+def snapshots(conn: sqlite3.Connection, item_id: int) -> list[dict[str, Any]]:
+    """Список копий без самих страниц: время, отпечаток, размер."""
+    rows = conn.execute(
+        "SELECT id, taken_at, sha256, size FROM snapshots WHERE item_id = ? "
+        "ORDER BY taken_at ASC",
+        (item_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def snapshot_page(conn: sqlite3.Connection, snapshot_id: int) -> str:
+    """Сама сохранённая страница. Нет такой — пустая строка, не исключение."""
+    import gzip  # noqa: PLC0415
+
+    row = conn.execute(
+        "SELECT packed FROM snapshots WHERE id = ?", (snapshot_id,)
+    ).fetchone()
+    if row is None:
+        return ""
+    return gzip.decompress(bytes(row["packed"])).decode("utf-8", "replace")
+
+
+def mark_gone(conn: sqlite3.Connection, item_id: int, code: int) -> None:
+    """Материал снят с публикации: код ответа и время, когда мы это увидели.
+
+    Время — наше наблюдение, а не момент снятия: между ними наш интервал
+    перечитывания, и выдавать одно за другое нельзя [NEWS-001].
+    """
+    conn.execute(
+        "UPDATE items SET gone_at = COALESCE(gone_at, ?), gone_code = ? WHERE id = ?",
+        (now(), int(code), item_id),
+    )
+    conn.commit()
+
+
+def revive(conn: sqlite3.Connection, item_id: int) -> None:
+    """Страница снова отвечает: отметку о снятии снимаем."""
+    conn.execute("UPDATE items SET gone_at = NULL, gone_code = NULL WHERE id = ?", (item_id,))
+    conn.commit()
+
+
+def gone(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, Any]]:
+    """Снятые с публикации, самые свежие первыми."""
+    rows = conn.execute(
+        "SELECT id, url, source, title, published_at, listed_at, gone_at, gone_code "
+        "FROM items WHERE gone_at IS NOT NULL ORDER BY gone_at DESC LIMIT ?",
+        (int(limit),),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def add_query(conn: sqlite3.Connection, user_id: int, query: str, *, title: str = "",
+              source: str = "", topic_id: int | None = None, only_original: bool = False,
+              only_revised: bool = False, notify: bool = True) -> int:
+    """Сохранённый запрос. Точка отсчёта — последний существующий материал.
+
+    Иначе первая же проверка вывалила бы человеку весь архив по слову
+    «тариф»: подписка обязана говорить о новом, а не о прошлом [NEWS-004].
+    """
+    row = conn.execute("SELECT COALESCE(MAX(id), 0) AS last FROM items").fetchone()
+    cursor = conn.execute(
+        "INSERT INTO saved_queries(user_id, title, query, source, topic_id, only_original, "
+        "only_revised, notify, last_item_id, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (user_id, title or query, query, source, topic_id, 1 if only_original else 0,
+         1 if only_revised else 0, 1 if notify else 0, int(row["last"]), now()),
+    )
+    conn.commit()
+    return int(cursor.lastrowid or 0)
+
+
+def queries(conn: sqlite3.Connection, user_id: int | None = None) -> list[dict[str, Any]]:
+    """Сохранённые запросы одного человека или все — для фонового обхода."""
+    if user_id is None:
+        rows = conn.execute("SELECT * FROM saved_queries ORDER BY id").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM saved_queries WHERE user_id = ? ORDER BY id", (user_id,)
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def drop_query(conn: sqlite3.Connection, query_id: int, user_id: int) -> bool:
+    """Удаляет свой запрос. Чужой не трогает даже по верному номеру."""
+    cursor = conn.execute(
+        "DELETE FROM saved_queries WHERE id = ? AND user_id = ?", (query_id, user_id)
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def mark_query_seen(conn: sqlite3.Connection, query_id: int, last_item_id: int) -> None:
+    """Запоминает, по какой материал запрос уже отдан. Назад не откатываем."""
+    conn.execute(
+        "UPDATE saved_queries SET last_item_id = MAX(last_item_id, ?) WHERE id = ?",
+        (int(last_item_id), query_id),
+    )
+    conn.commit()
+
+
 def mark_checked(conn: sqlite3.Connection, item_id: int) -> None:
     conn.execute(
         "UPDATE items SET checked_at = ?, checks = checks + 1 WHERE id = ?",
@@ -391,5 +561,9 @@ def mark_checked(conn: sqlite3.Connection, item_id: int) -> None:
     )
     conn.commit()
 
-__all__ = ("CACHE_KB", "DEFAULT_PATH", "LATE_COLUMNS", "SCHEMA", "STAMPS", "connect", "ensure", "fill",
-           "enrichment", "last_revision", "latency_of", "latency_rows", "mark_checked", "mark_dup", "neighbours", "now", "published", "remember", "save_enrichment", "revise", "save_vector", "set_fingerprint", "stamp", "vector_of")
+__all__ = ("CACHE_KB", "DEFAULT_PATH", "LATE_COLUMNS", "SCHEMA", "STAMPS", "add_query",
+           "connect", "drop_query", "ensure", "fill", "enrichment", "gone", "last_revision",
+           "latency_of", "latency_rows", "mark_checked", "mark_dup", "mark_gone",
+           "mark_query_seen", "neighbours", "now", "published", "queries", "remember",
+           "revise", "revisions", "revive", "save_enrichment", "save_snapshot", "save_vector",
+           "set_fingerprint", "snapshot_page", "snapshots", "stamp", "vector_of")
