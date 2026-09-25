@@ -32,6 +32,8 @@ def hush() -> None:
     for name in ("httpx", "httpcore", "hpack"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
+
+# Адрес метода Bot API. Фигурные скобки здесь — подстановка, а не текст.
 API = "https://api.telegram.org/bot{token}/{method}"
 # На случай, если в тексте ошибки окажется чужой или старый токен.
 TOKEN_RE = re.compile(r"bot\d{6,}:[A-Za-z0-9_-]{20,}")
@@ -117,4 +119,4 @@ class Bot:
         return result
 
 
-__all__ = ("API", "Bot", "MAX_
+__all__ = ("API", "Bot", "MAX_TEXT", "hush", "safe", "token")
