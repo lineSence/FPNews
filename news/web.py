@@ -330,6 +330,15 @@ def route(conn: Any, request: Request) -> Response:
         return Response(pages.feed(conn, user_id, theme=theme))
     if request.path == "/поиск":
         return Response(pages.search_page(conn, request.query, theme))
+    if request.path == "/сущности":
+        return Response(pages.entities_page(conn, request.query, theme))
+    if request.path == "/всплески":
+        return Response(pages.bursts_page(conn, theme))
+    if request.path == "/сущность":
+        карточка = pages.entity_page(conn, request.query.get("id", ""), theme)
+        if карточка is None:
+            return Response(pages.oops("Такой сущности нет.", theme), status="404 Not Found")
+        return Response(карточка)
     if request.path == "/правки":
         return Response(pages.changes_page(conn, theme))
     if request.path == "/источники":
