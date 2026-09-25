@@ -111,6 +111,23 @@ code, .ровно { font-family:ui-monospace, Menlo, Consolas, monospace; font-s
 .искра i.жар { background:var(--acc) }
 .панель h3 { margin:0 0 6px; font-size:14px; font-weight:600 }
 .панель > :last-child { margin-bottom:0 }
+.состояние { display:flex; gap:14px; align-items:center; justify-content:space-between;
+             flex-wrap:wrap; margin-top:-6px }
+.состояние form { margin:0 }
+.тумблер { display:inline-flex; align-items:center; gap:8px; background:none; border:0;
+           color:var(--ink); padding:0; cursor:pointer; font:inherit; font-size:13.5px }
+.тумблер i { width:34px; height:19px; border-radius:10px; background:var(--line);
+             position:relative; flex:none }
+.тумблер i::after { content:""; position:absolute; top:2px; left:2px; width:15px; height:15px;
+                    border-radius:50%; background:var(--panel); box-shadow:0 1px 2px #0003 }
+.тумблер.вкл i { background:var(--ok) }
+.тумблер.вкл i::after { left:17px }
+.чипы { display:flex; flex-wrap:wrap; gap:6px; margin:.2rem 0 }
+.чипы input { position:absolute; opacity:0; width:0; height:0 }
+.чипы span { display:inline-block; padding:4px 11px; border:1px solid var(--line);
+             border-radius:14px; background:var(--panel); cursor:pointer; font-size:13px }
+.чипы input:checked + span { background:var(--acc); border-color:var(--acc); color:#fff }
+.чипы input:focus-visible + span { outline:2px solid var(--lnk); outline-offset:1px }
 """
 
 # Разделы бокового меню: адрес, название, группа.
@@ -132,7 +149,12 @@ MENU = (
     ("Настройка", (
         ("/темы", "Мои темы"),
         ("/источники", "Источники"),
+    )),
+    ("Служебное", (
         ("/состояние", "Состояние"),
+        ("/хранение", "Хранение и архив"),
+        ("/диагностика", "Диагностика"),
+        ("/замеры", "Замеры"),
         ("/задержки", "Задержки"),
     )),
 )
@@ -257,6 +279,113 @@ def _summary_bar(conn: Any) -> str:
         for значение, подпись in ячейки))
 
 
+СЛОВАМИ = ("нуле", "одном", "двух", "трёх", "четырёх", "пяти", "шести", "семи",
+           "восьми", "девяти", "десяти")
+
+
+def изданиями(сколько: Any) -> str:
+    """«в пяти изданиях» — словами, потому что это читают, а не считают."""
+    число = int(сколько or 0)
+    если_слово = СЛОВАМИ[число] if 0 <= число < len(СЛОВАМИ) else str(число)
+    хвост = "издании" if число % 10 == 1 and число % 100 != 11 else "изданиях"
+    return "в {} {}".format(если_слово, хвост)
+
+
+def burst_words(row: dict[str, Any]) -> str:
+    """Всплеск словами: сколько сегодня, где и что здесь обычно."""
+    сегодня = "сегодня {} {}".format(row["сейчас"], изданиями(row.get("изданий")))
+    if row.get("новое"):
+        return сегодня + " · раньше в архиве не встречался, нормы нет [NEWS-001]"
+    норма = row.get("норма")
+    обычно = "обычно {}".format("ноль" if not норма else норма)
+    разброс = row.get("разброс")
+    if разброс:
+        обычно += " ± {}".format(разброс)
+    раз = row.get("во_сколько_раз")
+    хвост = " · ×{}".format(раз) if раз else ""
+    return "{} · {} в день{}".format(сегодня, обычно, хвост)
+
+
+def chip(name: str, value: str, title: str, on: bool) -> str:
+    """Чип-переключатель без единой строчки JavaScript.
+
+    Это обычный `input type=checkbox`, спрятанный за `label`: браузер сам
+    хранит состояние и сам отправляет его формой. Никакого скрипта, никакой
+    гидратации — работает и с выключенным JS [CORE-025].
+    """
+    return (
+        '<label><input type=checkbox name="{name}" value="{value}"{on}>'
+        "<span>{title}</span></label>"
+    ).format(name=html.escape(name), value=html.escape(str(value), quote=True),
+             title=html.escape(title), on=" checked" if on else "")
+
+
+def toggle(action: str, mark: str, fields: dict[str, Any], on: bool, title: str) -> str:
+    """Тумблер: форма с одной кнопкой, которая выглядит как переключатель.
+
+    Кнопка, а не чекбокс с автосохранением: без JS чекбокс пришлось бы
+    подтверждать отдельной кнопкой, и человек не понимал бы, сохранилось ли.
+    Нажал — состояние сменилось, страница перерисовалась [CORE-019].
+    """
+    скрытые = "".join(
+        '<input type=hidden name="{}" value="{}">'.format(
+            html.escape(str(key)), html.escape(str(value), quote=True))
+        for key, value in fields.items()
+    )
+    return (
+        '<form method=post action="{action}" style="display:inline">'
+        '<input type=hidden name=метка value="{mark}">{скрытые}'
+        '<button class="тумблер{вкл}" title="{title}"><i></i>{title}</button></form>'
+    ).format(action=action, mark=mark, скрытые=скрытые,
+             вкл=" вкл" if on else "", title=html.escape(title))
+
+
+def _status_line(conn: Any, mark: str) -> str:
+    """Строка состояния: идёт ли опрос, когда был последний заход, две кнопки.
+
+    Состояние живёт в памяти процесса (`news.bridge`), а не в базе: просьба
+    опросить переживать перезапуск не должна [CORE-025]. Если веб подняли
+    отдельно от сторожей, мы говорим об этом прямо, а не рисуем нули
+    [NEWS-001].
+    """
+    import time  # noqa: PLC0415
+
+    from . import bridge  # noqa: PLC0415
+
+    состояние = bridge.состояние()
+    if not состояние["сторожей"]:
+        слева = "<b>Сторожа в этом процессе не работают.</b> Страница показывает базу, " \
+                "а не сбор."
+    elif состояние["в_дверях"]:
+        слева = "<b>Опрос идёт:</b> {}".format(
+            html.escape(", ".join(label(code) for code in состояние["в_дверях"])))
+    else:
+        слева = "<b>Сторожей на посту:</b> {} · все ждут своей паузы".format(
+            состояние["сторожей"])
+    когда = состояние["последний_заход"]
+    подпись = ("последний заход {} назад".format(lag(time.time() - когда))
+               if когда else "заходов в этом процессе ещё не было")
+    проверка = состояние.get("проверка") or {}
+    ответ = (" · проверка связи: {} ({} назад)".format(
+        html.escape(str(проверка.get("ответ", ""))),
+        lag(time.time() - float(проверка["когда"]))) if проверка.get("когда") else "")
+    кнопки = (
+        '<form class=строка method=post action="/опросить" style="display:inline">'
+        '<input type=hidden name=метка value="{mark}">'
+        "<button>Опросить сейчас</button></form> "
+        '<form class=строка method=post action="/проверка" style="display:inline">'
+        '<input type=hidden name=метка value="{mark}">'
+        "<button class=тихо>Тест в бот</button></form>"
+    ).format(mark=mark)
+    return (
+        '<div class="панель состояние"><div>{слева}'
+        '<div class=тихо>{подпись} · память {память}{ответ}</div></div>'
+        "<div>{кнопки}</div></div>"
+    ).format(слева=слева, подпись=подпись,
+             память=("{} МБ".format(store.memory_mb()) if store.memory_mb() else "—"),
+             ответ=ответ, кнопки=кнопки)
+
+
 def _change_cards(conn: Any, limit: int = 50) -> list[str]:
     """Карточки правок и снятий — общие для главной и для страницы правок."""
     from . import diff as diff_module  # noqa: PLC0415
@@ -350,11 +479,9 @@ def _burst_block(conn: Any, limit: int = 5) -> str:
         куски.append(
             '<div class=панель><div class=искра>{искра}</div>'
             '<a href="/сущность?id={id}">{name}</a> '
-            '<span class=тихо>{kind} · {сейчас} за двое суток · {фон}</span></div>'.format(
+            '<span class=тихо>{kind} · {словами}</span></div>'.format(
                 искра=искра, id=int(row["id"]), name=html.escape(str(row["имя"])),
-                kind=html.escape(str(row["вид"])), сейчас=row["сейчас"],
-                фон=("раньше не встречался — фона нет [NEWS-001]" if row["новое"]
-                     else "фон {} в день · ×{}".format(row["фон"], row["во_сколько_раз"])))
+                kind=html.escape(str(row["вид"])), словами=html.escape(burst_words(row)))
         )
     return ("<h2>Всплески</h2>" + "".join(куски) +
             '<p class=тихо><a href="/всплески">Все всплески</a> · полоска — упоминания '
@@ -371,7 +498,7 @@ def _sources_panel(conn: Any) -> str:
         текущее = состояние.get(code, {})
         последний = conn.execute(
             "SELECT COUNT(*) AS всего, MAX(listed_at) AS последний FROM items "
-            "WHERE source = ? AND listed_at >= datetime('now', '-1 day')",
+            "WHERE source = ? AND julianday(listed_at) >= julianday('now', '-1 day')",
             (code,),
         ).fetchone()
         включён = bool(текущее.get("включён", True))
@@ -447,7 +574,7 @@ def home(conn: Any, user_id: int, mark: str, theme: str = "система") -> s
              '<input type=hidden name=метка value="{}">'
              "<button class=тихо>Выйти</button></form>").format(mark)
     return page("Что происходило за сутки",
-                _summary_bar(conn) +
+                _summary_bar(conn) + _status_line(conn, mark) +
                 '<div class=две><div>{}</div><div>{}{}</div></div>'.format(
                     левая, правая, выход),
                 theme, "/")
@@ -718,9 +845,12 @@ def stream_page(conn: Any, user_id: int, query: dict[str, str], theme: str = "с
             куски.append("<ul>{}</ul>".format(
                 "".join(_stream_row(row) for row in group)))
     куски.append(
-        '<p class=тихо>Выгрузить: <a href="{csv}">CSV</a> · <a href="{json}">JSON</a></p>'.format(
+        '<p class=тихо>Выгрузить: <a href="{csv}">CSV</a> · <a href="{json}">JSON</a>{досье}'
+        "</p>".format(
             csv=stream.link(flt, формат="csv").replace("/лента?", "/выгрузка?"),
-            json=stream.link(flt, формат="json").replace("/лента?", "/выгрузка?")))
+            json=stream.link(flt, формат="json").replace("/лента?", "/выгрузка?"),
+            досье=(' · <a href="/досье?q={}">Собрать досье</a>'.format(
+                urllib.parse.quote(flt.words)) if getattr(flt, "words", "") else "")))
     шаги = []
     if flt.page > 1:
         шаги.append('<a href="{}">назад</a>'.format(stream.link(flt, стр=flt.page - 1)))
@@ -937,14 +1067,12 @@ def sources_page(conn: Any, mark: str, theme: str = "система") -> str:
             '<input type=hidden name=код value="{code}">'
             '<input type=number name=секунд value="{every}" min=0 step=30 size=5>'
             "<button class=тихо>Сохранить</button></form></td>"
-            "<td><form method=post action=\"/источники/переключить\">"
-            '<input type=hidden name=метка value="{mark}">'
-            '<input type=hidden name=код value="{code}">'
-            "<button>{action}</button></form></td></tr>".format(
+            "<td>{тумблер}</td></tr>".format(
                 name=label(code), count=int(last["всего"] or 0),
                 last=when(last["последний"]), mark=mark, code=html.escape(code),
                 every=every or int(source.interval),
-                action="выключить" if enabled else "включить",
+                тумблер=toggle("/источники/переключить", mark, {"код": code}, enabled,
+                               "опрашиваем" if enabled else "не опрашиваем"),
             )
         )
     table = (
@@ -963,27 +1091,38 @@ def telegram_page(conn: Any, user_id: int, mark: str, theme: str = "систем
     row = conn.execute(
         "SELECT quiet_from, quiet_to FROM users WHERE id = ?", (int(user_id),)
     ).fetchone()
-    boxes = "".join(
-        '<label><input type=checkbox name=вид value="{kind}"{on}> {kind}</label> '.format(
-            kind=html.escape(kind), on=" checked" if kind in chosen else "")
-        for kind in store.KINDS
-    )
+    boxes = '<div class=чипы>{}</div>'.format("".join(
+        chip("вид", kind, kind, kind in chosen) for kind in store.KINDS))
+    адресат = store.target_of(conn, user_id)
     form = (
         '<form method=post action="/телеграм/сохранить">'
         '<input type=hidden name=метка value="{mark}">'
         "<div class=панель>{boxes}</div>"
-        '<div class=панель>тихие часы с '
+        '<div class="панель строка-полей">тихие часы с '
         '<input type=text name=с value="{since}" size=5 placeholder="23:00"> по '
-        '<input type=text name=по value="{until}" size=5 placeholder="08:00"></div>'
+        '<input type=text name=по value="{until}" size=5 placeholder="08:00">'
+        '<span>· задержка отдачи '
+        '<input type=number name=задержка value="{delay}" min=0 max=1440 size=4> мин</span>'
+        '<span>· адресат '
+        '<input type=text name=адресат value="{target}" size=16 '
+        'placeholder="личка"></span></div>'
         "<button>Сохранить</button></form>"
     ).format(mark=mark, boxes=boxes,
              since=html.escape(str(row["quiet_from"] if row else "") or "", quote=True),
-             until=html.escape(str(row["quiet_to"] if row else "") or "", quote=True))
+             until=html.escape(str(row["quiet_to"] if row else "") or "", quote=True),
+             delay=store.delay_of(conn, user_id),
+             target="" if адресат == int(user_id) else адресат)
     return page("Отдача в Telegram",
                 "<h2>Виды сообщений и тишина</h2>" + form +
                 "<p class=тихо>Виды: «сырое» — первое сообщение по заголовку, «дополнение» — "
                 "когда приехал текст, «изменение» — правка или снятие, «тоже_написали» — "
-                "перепечатка, «запрос» — находка по сохранённому запросу.</p>" +
+                "перепечатка, «запрос» — находка по сохранённому запросу.</p>"
+                "<p class=тихо>Задержка отдачи: ноль — слать сразу, 10 — подождать десять "
+                "минут после выхода, пока текст устоится. Отсчёт от времени публикации, "
+                "а если издание его не дало — от момента, когда мы увидели ссылку "
+                "[NEWS-001]. Адресат: пусто — личка, иначе номер канала вида "
+                "<span class=ровно>-1001234567890</span>; бота нужно добавить туда "
+                "администратором.</p>" +
                 _sources_form(conn, user_id, mark) + _topics_form(conn, user_id, mark),
                 theme, "/телеграм")
 
@@ -993,17 +1132,14 @@ def _sources_form(conn: Any, user_id: int, mark: str) -> str:
     from . import sources as sources_module  # noqa: PLC0415
 
     chosen = store.user_sources(conn, user_id)
-    boxes = "".join(
-        '<label><input type=checkbox name=издание value="{code}"{on}> {name}</label>'.format(
-            code=html.escape(code), name=label(code),
-            on=" checked" if (not chosen or code in chosen) else "")
-        for code in sorted(sources_module.BY_CODE)
-    )
+    boxes = '<div class=чипы>{}</div>'.format("".join(
+        chip("издание", code, label(code), not chosen or code in chosen)
+        for code in sorted(sources_module.BY_CODE)))
     return (
         "<h2>Издания в отдаче</h2>"
         '<form method=post action="/телеграм/издания">'
         '<input type=hidden name=метка value="{mark}">'
-        "<div class=панель><div class=издания>{boxes}</div></div>"
+        "<div class=панель>{boxes}</div>"
         "<button>Сохранить издания</button></form>"
         "<p class=тихо>Это фильтр отдачи, а не сбора: выключенное здесь издание всё равно "
         "собирается и остаётся в архиве и в общей ленте. Чтобы не опрашивать его вовсе — "
@@ -1018,16 +1154,13 @@ def _topics_form(conn: Any, user_id: int, mark: str) -> str:
     mine = store.topics_of(conn, user_id)
     if not mine:
         return ("<h2>Темы в отдаче</h2><p class=тихо>Тем пока нет. "
-                'Заведите первую на странице <a href="/">Темы</a>.</p>')
+                'Заведите первую на странице <a href="/темы">Мои темы</a>.</p>')
     строки = []
     for topic in mine:
         codes = {code.strip() for code in str(topic["sources"] or "").split(",") if code.strip()}
-        boxes = "".join(
-            '<label><input type=checkbox name=издание value="{code}"{on}> {name}</label>'.format(
-                code=html.escape(code), name=label(code),
-                on=" checked" if (not codes or code in codes) else "")
-            for code in sorted(sources_module.BY_CODE)
-        )
+        boxes = '<div class=чипы>{}</div>'.format("".join(
+            chip("издание", code, label(code), not codes or code in codes)
+            for code in sorted(sources_module.BY_CODE)))
         строки.append(
             '<form method=post action="/телеграм/тема"><div class=панель>'
             '<input type=hidden name=метка value="{mark}">'
@@ -1036,7 +1169,7 @@ def _topics_form(conn: Any, user_id: int, mark: str) -> str:
             '<span class=тихо>{words}</span>'
             '<label><input type=checkbox name=отдавать value=1{on}> отдавать в бот</label>'
             "<button class=тихо>Сохранить</button></div>"
-            "<div class=издания>{boxes}</div></div></form>".format(
+            "{boxes}</div></form>".format(
                 mark=mark, id=int(topic["id"]),
                 title=html.escape(str(topic["title"])),
                 words=html.escape(str(topic["words"] or "")),
@@ -1178,34 +1311,43 @@ def entity_page(conn: Any, raw_id: Any, theme: str = "система") -> str | 
         '<p class=тихо>Упоминания по дням за месяц. Пустой день — мы ничего не видели, '
         'а не «ничего не писали» [NEWS-001].</p>'
         '<h2>Где встречается</h2><ul>{строки}</ul>'
-        '<p><a href="/лента?q={поиск}">Искать это слово в ленте</a></p>'
+        '<p><a href="/лента?q={поиск}">Искать это слово в ленте</a> · '
+        '<a href="/досье?сущность={номер}">Собрать досье</a></p>'
     ).format(kind=html.escape(str(карточка["kind"])), count=len(материалы),
              полоска=полоска or '<span class=тихо>пусто</span>', строки=строки,
+             номер=int(карточка["id"]),
              поиск=urllib.parse.quote(str(карточка["name"])))
     return page(str(карточка["name"]), тело, theme, "/сущности")
 
 
 def bursts_page(conn: Any, theme: str = "система") -> str:
-    """Всплески: о ком вдруг стали писать чаще обычного."""
+    """Всплески: о ком вдруг стали писать чаще своей же нормы."""
     строки = store.bursts(conn)
     if not строки:
-        тело = ("<p class=тихо>Всплесков не видно. Это значит, что за последние двое суток "
-                "никто не выбился из своего обычного фона [NEWS-001].</p>")
+        тело = ("<p class=тихо>Всплесков не видно: никто не выбился из своей обычной "
+                "нормы. Это наблюдение о письме, а не о тишине в городе [NEWS-001].</p>")
     else:
-        тело = ("<table><tr><th>кто или что</th><th>вид</th><th>за двое суток</th>"
-                "<th>фон в день</th><th>во сколько раз</th></tr>{}</table>").format(
-            "".join(
-                '<tr><td><a href="/сущность?id={id}">{name}</a></td><td class=тихо>{kind}</td>'
-                "<td>{сейчас}</td><td>{фон}</td><td>{раз}</td></tr>".format(
-                    id=int(row["id"]), name=html.escape(str(row["имя"])),
-                    kind=html.escape(str(row["вид"])), сейчас=row["сейчас"], фон=row["фон"],
-                    раз="впервые" if row["новое"] else "×{}".format(row["во_сколько_раз"]))
-                for row in строки)
+        тело = ("<table><tr><th>кто или что</th><th>вид</th><th>сегодня</th>"
+                "<th>обычно в день</th><th>разброс</th><th>отклонение</th></tr>{}</table>"
+                ).format("".join(
+            '<tr><td><a href="/сущность?id={id}">{name}</a></td>'
+            '<td class=тихо>{kind}</td><td>{сегодня}</td><td>{норма}</td>'
+            "<td>{разброс}</td><td>{откл}</td></tr>".format(
+                id=int(row["id"]), name=html.escape(str(row["имя"])),
+                kind=html.escape(str(row["вид"])),
+                сегодня="{} {}".format(row["сейчас"], изданиями(row.get("изданий"))),
+                норма="—" if row["новое"] else row["норма"],
+                разброс="—" if row["новое"] else row["разброс"],
+                откл="впервые" if row["новое"] else "{} MAD".format(row["отклонение"]))
+            for row in строки)
         )
     return page("Всплески", тело +
-                "<p class=тихо>Считаем упоминания за двое суток против среднего за месяц. "
-                "Всплеск говорит «стали писать чаще», а не «что-то случилось»: объяснение "
-                "остаётся за человеком [NEWS-008].</p>", theme, "/всплески")
+                "<p class=тихо>Норма — медиана упоминаний по дням за четыре недели, "
+                "разброс — медиана отклонений от неё (MAD). Среднее здесь врёт: один "
+                "громкий день задирает его так, что следующий такой же уже не выглядит "
+                "всплеском [CORE-019]. Всплеск говорит «стали писать чаще», а не "
+                "«что-то случилось»: объяснение остаётся за человеком [NEWS-008].</p>",
+                theme, "/всплески")
 
 
 def digest_page(conn: Any, user_id: int, mark: str, theme: str = "система") -> str:
@@ -1266,6 +1408,130 @@ def state_page(conn: Any, theme: str = "система") -> str:
                 "обычным промежутком за месяц, а не с выдуманной нормой.</p>"
                 "<h2>Объём</h2><table>{}</table><h2>Строк в таблицах</h2><table>{}</table>"
                 .format(объёмы, счёт), theme, "/состояние")
+
+
+def storage_page(conn: Any, mark: str, theme: str = "система") -> str:
+    """Хранение и архив: сколько занято, за какой срок и что можно выбросить."""
+    размеры = store.sizes(conn)
+    архив = store.archive_span(conn)
+    объёмы = "".join(
+        "<tr><td>{}</td><td>{}</td></tr>".format(html.escape(имя), значение)
+        for имя, значение in (
+            ("файл базы, КБ", размеры["база_кб"]),
+            ("копии страниц сжатые, КБ", размеры["копии_кб"]),
+            ("копии страниц исходные, КБ", размеры["копии_исходно_кб"]),
+            ("поисковый индекс, КБ", store.index_size(conn) or "—"),
+        )
+    )
+    счёт = "".join(
+        "<tr><td>{}</td><td>{}</td></tr>".format(html.escape(имя), значение)
+        for имя, значение in размеры["строк"].items()
+    )
+    чистка = (
+        '<form class=строка method=post action="/хранение/копии">'
+        '<input type=hidden name=метка value="{mark}">'
+        "выбросить копии страниц старше "
+        '<input type=number name=дней value="180" min=1 max=3650 size=4> дней'
+        "<button class=тихо>Выбросить</button></form>"
+        '<form class=строка method=post action="/хранение/сжать">'
+        '<input type=hidden name=метка value="{mark}">'
+        "<button class=тихо>Сжать файл базы</button></form>"
+    ).format(mark=mark)
+    return page(
+        "Хранение и архив",
+        "<div class=панель>Архив с {первый} по {последний} · {всего} материалов · "
+        "{копий} копий страниц, первая {первая}</div>"
+        "<h2>Объём</h2><table>{объёмы}</table>"
+        "<h2>Строк в таблицах</h2><table>{счёт}</table>"
+        "<h2>Чистка</h2>{чистка}"
+        "<p class=тихо>Копия страницы — единственное, чем мы можем подтвердить, что "
+        "текст был именно таким [NEWS-007]. Поэтому чистка только по возрасту и только "
+        "по прямой просьбе. Удаление не уменьшает файл само по себе: место освобождает "
+        "«сжать».</p>".format(
+            первый=when(архив["первый"]), последний=when(архив["последний"]),
+            всего=архив["всего"], копий=архив["копий"],
+            первая=when(архив["первая_копия"]), объёмы=объёмы, счёт=счёт, чистка=чистка),
+        theme, "/хранение")
+
+
+def diagnostics_page(theme: str = "система") -> str:
+    """Диагностика: что пишет `diag.py` и где лежит последний журнал."""
+    import diag  # noqa: PLC0415 — модуль верхнего уровня, нужен только здесь
+
+    файл = diag.latest()
+    if файл is None:
+        тело = ("<p class=тихо>Диагностических журналов нет. Запись включается "
+                "переменной <span class=ровно>DIAG_RUN=1</span> при запуске: постоянно "
+                "писать всё подряд на сервере с полугигабайтом памяти незачем "
+                "[CORE-025].</p>")
+    else:
+        сводка = diag.summary(файл)
+        строки = "".join(
+            "<tr><td>{}</td><td>{}</td></tr>".format(html.escape(str(имя)),
+                                                     html.escape(str(значение)))
+            for имя, значение in sorted(сводка.get("по видам", {}).items())
+        ) or "<tr><td colspan=2 class=тихо>событий в журнале нет</td></tr>"
+        беды = "".join(
+            "<tr><td>{}</td><td>{}</td></tr>".format(html.escape(str(имя)),
+                                                     html.escape(str(сколько)))
+            for имя, сколько in sorted(сводка.get("сбои модели", {}).items())
+        )
+        тело = (
+            '<div class=панель>Последний журнал: <span class=ровно>{файл}</span> · '
+            "{размер} КБ · событий {всего}</div>"
+            "<h2>Событий по видам</h2><table>{строки}</table>{беды}"
+        ).format(файл=html.escape(str(файл)), всего=сводка.get("событий", 0),
+                 размер=round(файл.stat().st_size / 1024, 1), строки=строки,
+                 беды=("<h2>Сбои</h2><table>{}</table>".format(беды) if беды else ""))
+    return page("Диагностика", тело +
+                "<p class=тихо>Журнал пишется построчно в JSON и чистится от ключей и "
+                "токенов при записи [CORE-016]. Показываем сводку, а не сам файл: "
+                "тысяча строк глазами не читается.</p>", theme, "/диагностика")
+
+
+def measures_page(conn: Any, theme: str = "система") -> str:
+    """Замеры: сколько времени занимает путь новости от издания до человека."""
+    import time  # noqa: PLC0415
+
+    from . import bridge  # noqa: PLC0415
+
+    строки = "".join(
+        "<tr><td>{name}</td><td>{замеров}</td><td>{ред}</td><td>{отпр}</td>"
+        "<td>{полн}</td></tr>".format(
+            name=label(row["код"]), замеров=row["замеров"],
+            ред="—" if row["редакционная_мин"] is None else "{} мин".format(
+                row["редакционная_мин"]),
+            отпр="—" if row["до_отправки_сек"] is None else "{} с".format(
+                row["до_отправки_сек"]),
+            полн="—" if row["до_полного_сек"] is None else "{} с".format(
+                row["до_полного_сек"]))
+        for row in store.measurements(conn)
+    ) or "<tr><td colspan=5 class=тихо>замеров пока нет</td></tr>"
+    заходы = "".join(
+        "<tr><td>{name}</td><td>{код}</td><td>{найдено}</td><td>{новых}</td>"
+        "<td>{когда}</td></tr>".format(
+            name=label(код), код=шаг["код"], найдено=шаг["найдено"], новых=шаг["новых"],
+            когда="{} назад".format(lag(time.time() - шаг["когда"])))
+        for код, шаг in sorted(bridge.ЖУРНАЛ.items())
+    ) or ("<tr><td colspan=5 class=тихо>в этом процессе сторожа не ходили "
+          "[NEWS-001]</td></tr>")
+    свод = store.summary(conn)
+    return page(
+        "Замеры",
+        "<h2>Задержки по изданиям</h2>"
+        "<table><tr><th>издание</th><th>замеров</th><th>вышло → у нас</th>"
+        "<th>у нас → отправлено</th><th>отправлено → дополнено</th></tr>{строки}</table>"
+        "<p class=тихо>Медиана, а не среднее: один залипший материал не должен решать "
+        "за всех [CORE-019]. Прочерк значит «не измеряли», а не «ноль» [NEWS-001].</p>"
+        "<h2>Последние заходы в этом процессе</h2>"
+        "<table><tr><th>издание</th><th>ответ</th><th>ссылок</th><th>новых</th>"
+        "<th>когда</th></tr>{заходы}</table>"
+        "<h2>Поиск</h2><div class=панель>запрос по индексу: {поиск} · индекс {индекс} КБ · "
+        "память процесса {память} МБ</div>".format(
+            строки=строки, заходы=заходы,
+            поиск="—" if свод["поиск_мс"] is None else "{} мс".format(свод["поиск_мс"]),
+            индекс=свод["индекс_кб"] or "—", память=store.memory_mb() or "—"),
+        theme, "/замеры")
 
 
 def copy_page(conn: Any, raw_id: Any) -> str | None:
