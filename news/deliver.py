@@ -98,7 +98,8 @@ async def send_also(bot: Any, conn: sqlite3.Connection, item_id: int, original_i
                            str(item.get("source") or "")):
         if hit.user_id not in got:
             continue  # обычную отправку сделает send_item
-        if already(conn, item_id, hit.user_id, "тоже_написали"):
+        if already(conn, item_id, hit.user_id, "тоже_написали") or not wants(
+                conn, hit.user_id, "тоже_написали"):
             continue
         if not await bot.send(hit.user_id, also_message(item, original), preview=False,
                               keyboard=enrich.keyboard(item_id)):
@@ -122,13 +123,35 @@ async def send_change(bot: Any, conn: sqlite3.Connection, item_id: int, text: st
     sent = 0
     for row in rows:
         user_id = int(row["user_id"])
-        if already(conn, item_id, user_id, "изменение"):
+        if already(conn, item_id, user_id, "изменение") or not wants(
+                conn, user_id, "изменение"):
             continue
         if not await bot.send(user_id, text, preview=False):
             continue
         record(conn, item_id, user_id, row["topic_id"], "изменение")
         sent += 1
     return sent
+
+
+def wants(conn: sqlite3.Connection, user_id: int, kind: str) -> bool:
+    """Согласен ли человек получать такой вид сообщений (страница «Отдача»)."""
+    return kind in store.kinds_of(conn, user_id)
+
+
+async def send_to(bot: Any, conn: sqlite3.Connection, item_id: int, user_id: int,
+                  text: str, kind: str = "запрос") -> int:
+    """Отправка одному человеку по его сохранённому запросу.
+
+    Тем же путём, что и всё остальное: та же защита от повторов в
+    `deliveries`, тот же вид отправки в журнале. Иначе перезапуск процесса
+    прислал бы человеку то же самое второй раз [NEWS-004].
+    """
+    if not item_id or already(conn, item_id, user_id, kind) or not wants(conn, user_id, kind):
+        return 0
+    if not await bot.send(user_id, text, preview=False, keyboard=enrich.keyboard(item_id)):
+        return 0
+    record(conn, item_id, user_id, None, kind)
+    return 1
 
 
 async def send_item(bot: Any, conn: sqlite3.Connection, item_id: int) -> int:
@@ -147,7 +170,7 @@ async def send_item(bot: Any, conn: sqlite3.Connection, item_id: int) -> int:
         if hit.user_id in knew:
             # Ему уже приходил оригинал: перепечатка уйдёт как «тоже написали».
             continue
-        if already(conn, item_id, hit.user_id, "сырое"):
+        if already(conn, item_id, hit.user_id, "сырое") or not wants(conn, hit.user_id, "сырое"):
             continue
         if not await bot.send(hit.user_id, message(item, hit),
                               keyboard=enrich.keyboard(item_id)):
@@ -193,4 +216,4 @@ def record(conn: sqlite3.Connection, item_id: int, user_id: int, topic_id: int, 
 
 
 __all__ = ("LABEL", "NOTICE", "already", "also_message", "message", "record", "send_also",
-           "send_change", "send_item", "subscribers")
+           "send_change", "send_item", "send_to", "subscribers", "wants")

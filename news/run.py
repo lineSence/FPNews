@@ -20,8 +20,8 @@ from typing import Any
 
 import diag
 
-from . import (article, dedup, deliver, fetch, model, recheck, sources, store, story,
-               telegram, web)
+from . import (article, dedup, deliver, fetch, model, queries, recheck, sources, store,
+               story, telegram, web)
 
 log = logging.getLogger("fpnews")
 
@@ -63,7 +63,11 @@ async def handle(bot: Any, session: Any, conn: Any, item_id: int,
         return sent
     item = dict(row)
     if not item.get("body"):
-        parsed = await article.load(session, str(item["url"]))
+        poll, parsed = await article.load_page(session, str(item["url"]))
+        if poll.body:
+            # Копия страницы снимается сразу: материал могут снять раньше,
+            # чем до него дойдёт перечитывание [NEWS-007].
+            store.save_snapshot(conn, item_id, poll.body)
         if not parsed.empty:
             store.fill(conn, item_id, parsed.lead, parsed.body, store.now())
             if parsed.published_at and not item.get("published_at"):
@@ -130,12 +134,17 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
         bot = telegram.Bot(session)
         if not bot.ready:
             log.warning("TELEGRAM_BOT_TOKEN не задан: новости будут копиться в базе без рассылки")
+        # Выключенные в интерфейсе издания не опрашиваются вовсе: это
+        # настройка, а не фильтр выдачи.
+        живые = [code for code in codes if store.source_enabled(conn, code)]
+        if len(живые) != len(codes):
+            log.info("выключено в интерфейсе: %s", ", ".join(sorted(set(codes) - set(живые))))
         watchers = [
             asyncio.create_task(
                 watch.loop(session, sources.BY_CODE[code], conn, stop, queue, rounds),
                 name="сторож-{}".format(code),
             )
-            for code in codes
+            for code in живые
         ]
         sender = asyncio.create_task(
             dispatch(bot, conn, queue, stop, done, session, budget), name="рассылка"
@@ -152,6 +161,9 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
         keeper = asyncio.create_task(
             recheck.loop(bot, session, conn, stop), name="перечитывание"
         )
+        asker = asyncio.create_task(
+            queries.loop(bot, conn, stop), name="сохранённые-запросы"
+        )
         try:
             await asyncio.gather(*watchers)
         except asyncio.CancelledError:  # pragma: no cover — снаружи
@@ -160,6 +172,7 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
         sent = await sender
         stop.set()
         changes = await keeper
+        found = await asker
         site.cancel()
         if talker is not None:
             stop.set()
@@ -167,6 +180,7 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
     summary = report(conn)
     summary["разослано"] = sent
     summary["досылок_об_изменениях"] = changes
+    summary["по_сохранённым_запросам"] = found
     summary["вызовов_модели"] = budget.calls
     if budget.embeds:
         summary["векторов"] = budget.embeds

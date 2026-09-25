@@ -136,8 +136,11 @@ async def loop(
         rounds += 1
         if limit and rounds >= limit:
             break
+        # Интервал можно переопределить в интерфейсе: у разных лент разный темп,
+        # а править код ради этого не должно быть нужно.
+        every = store.source_every(conn, source.code) or source.interval
         try:
-            await asyncio.wait_for(stop.wait(), timeout=source.interval * door.backoff)
+            await asyncio.wait_for(stop.wait(), timeout=every * door.backoff)
         except asyncio.TimeoutError:
             continue
     return rounds
