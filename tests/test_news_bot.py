@@ -83,6 +83,7 @@ def test_чужая_тема_не_видна(tmp_path: Path) -> None:
 
 def test_команды_бота(tmp_path: Path) -> None:
     conn = store.connect(tmp_path / "db.sqlite3")
+    bot.ensure_user(conn, 7, "Имя")
     assert "приношу новости" in bot.answer(conn, 7, "Имя", "/старт")
     assert "добавлена" in bot.answer(conn, 7, "Имя", "/добавить метро, транспорт")
     assert "метро" in bot.answer(conn, 7, "Имя", "/темы")
@@ -113,3 +114,68 @@ def test_токен_не_попадает_в_лог(monkeypatch) -> None:
     assert "AAsecret" not in telegram.safe(ошибка)
     # Чужой токен в тексте тоже маскируется.
     assert "bot…" in telegram.safe("bot999999:BBotherotherotherother/sendMessage")
+
+
+def test_бот_закрыт_для_незнакомого(tmp_path: Path, monkeypatch) -> None:
+    """Раньше учётку получал любой, кто написал «/старт» [CORE-016]."""
+    from news import access
+
+    monkeypatch.delenv("FPNEWS_OWNER", raising=False)
+    monkeypatch.setenv("FPNEWS_SECRET", "секрет")
+    access.забыть_попытки()
+    conn = store.connect(tmp_path / "db.sqlite3")
+    ответ = bot.answer(conn, 42, "Чужой", "/старт")
+    assert "закрытая система" in ответ and "42" in ответ
+    assert "приношу новости" not in ответ
+    assert conn.execute("SELECT count(*) c FROM users").fetchone()["c"] == 0
+    # И остальные команды тоже закрыты, а не «просто без тем».
+    assert "закрытая система" in bot.answer(conn, 42, "Чужой", "/добавить дрон")
+    assert conn.execute("SELECT count(*) c FROM topics").fetchone()["c"] == 0
+
+
+def test_ключ_открывает_доступ_один_раз(tmp_path: Path, monkeypatch) -> None:
+    from news import access
+
+    monkeypatch.setenv("FPNEWS_SECRET", "секрет")
+    access.забыть_попытки()
+    conn = store.connect(tmp_path / "db.sqlite3")
+    ключ, _ = access.выдать(conn, "Петя")
+    assert "Ключ принят" in bot.answer(conn, 43, "Петя", "/ключ " + ключ)
+    assert "приношу новости" in bot.answer(conn, 43, "Петя", "/старт")
+    # Тем же ключом второй человек не войдёт.
+    assert "закрытая система" in bot.answer(conn, 44, "Вася", "/ключ " + ключ)
+    assert not access.известен(conn, 44)
+
+
+def test_неверный_ключ_отвечает_одинаково_и_кончается(tmp_path: Path, monkeypatch) -> None:
+    from news import access
+
+    monkeypatch.setenv("FPNEWS_SECRET", "секрет")
+    access.забыть_попытки()
+    conn = store.connect(tmp_path / "db.sqlite3")
+    чужой = bot.answer(conn, 45, "Чужой", "/ключ " + access.новый_ключ())
+    мусор = bot.answer(conn, 45, "Чужой", "/ключ мусор")
+    assert чужой == мусор == bot.ЗАКРЫТО.format(45)
+    for _ in range(access.ПОПЫТОК):
+        bot.answer(conn, 45, "Чужой", "/ключ " + access.новый_ключ())
+    # Попытки кончились — ответ тот же, настоящий ключ уже не поможет.
+    ключ, _ = access.выдать(conn, "Петя")
+    assert bot.answer(conn, 45, "Чужой", "/ключ " + ключ) == bot.ЗАКРЫТО.format(45)
+    assert not access.известен(conn, 45)
+
+
+def test_приглашения_выдаёт_только_владелец(tmp_path: Path, monkeypatch) -> None:
+    from news import access
+
+    monkeypatch.setenv("FPNEWS_SECRET", "секрет")
+    monkeypatch.setenv("FPNEWS_OWNER", "70")
+    access.забыть_попытки()
+    conn = store.connect(tmp_path / "db.sqlite3")
+    хозяин = bot.answer(conn, 70, "Хозяин", "/пригласить Петя")
+    assert "Приглашение №1" in хозяин
+    ключ = хозяин.split("/ключ ")[1].split("<")[0].strip()
+    assert access.похож_на_ключ(ключ)
+    assert "Ключ принят" in bot.answer(conn, 71, "Петя", "/ключ " + ключ)
+    assert "только владелец" in bot.answer(conn, 71, "Петя", "/пригласить Вася")
+    assert "только владельцу" in bot.answer(conn, 71, "Петя", "/доступы")
+    assert "Петя" in bot.answer(conn, 70, "Хозяин", "/доступы")
