@@ -31,7 +31,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import pages, store
+from . import bridge, pages, store
 
 log = logging.getLogger("fpnews.web")
 
@@ -250,7 +250,7 @@ def csrf(token: str) -> str:
 
 # Разделы, куда возвращаемся после формы: список закрыт, чтобы адрес из
 # формы не превратился в редирект куда попало.
-_SECTIONS = ("/запросы", "/источники", "/сводка", "/телеграм", "/темы")
+_SECTIONS = ("/запросы", "/источники", "/сводка", "/телеграм", "/темы", "/хранение")
 
 
 def _number(raw: Any) -> int:
@@ -305,6 +305,17 @@ def route(conn: Any, request: Request) -> Response:
             store.drop_query(conn, _number(request.form.get("номер")), user_id)
         elif request.path == "/запросы/уведомления":
             store.toggle_notify(conn, _number(request.form.get("номер")), user_id)
+        elif request.path == "/хранение/копии":
+            выброшено = store.drop_old_snapshots(conn, request.form.get("дней", ""))
+            log.info("выброшено копий страниц: %s", выброшено)
+        elif request.path == "/хранение/сжать":
+            log.info("сжатие базы освободило %s КБ", store.compact(conn))
+        elif request.path == "/опросить":
+            # Веб только будит сторожей и сразу отвечает: ходить в чужие двери
+            # прямо из обработчика страницы нельзя [NEWS-002].
+            bridge.попросить()
+        elif request.path == "/проверка":
+            bridge.проверить(user_id)
         elif request.path == "/источники/переключить":
             code = request.form.get("код", "")
             store.set_source(conn, code, enabled=not store.source_enabled(conn, code))
@@ -314,6 +325,8 @@ def route(conn: Any, request: Request) -> Response:
         elif request.path == "/телеграм/сохранить":
             store.set_kinds(conn, user_id, request.all_of("вид"))
             store.set_quiet(conn, user_id, request.form.get("с", ""), request.form.get("по", ""))
+            store.set_delay(conn, user_id, request.form.get("задержка", "0"))
+            store.set_target(conn, user_id, request.form.get("адресат", ""))
         elif request.path == "/сводка/время":
             store.set_digest(conn, user_id, request.form.get("время", ""))
         elif request.path == "/телеграм/издания":
@@ -348,6 +361,20 @@ def route(conn: Any, request: Request) -> Response:
         вид = request.query.get("формат", "csv")
         тело, тип, имя = export.make(conn, request.query, вид, request.all_asked)
         return Response(тело, kind=тип, filename=имя)
+    if request.path == "/хранение":
+        return Response(pages.storage_page(conn, csrf(token), theme))
+    if request.path == "/диагностика":
+        return Response(pages.diagnostics_page(theme))
+    if request.path == "/замеры":
+        return Response(pages.measures_page(conn, theme))
+    if request.path == "/досье":
+        from . import export  # noqa: PLC0415 — нужен только здесь
+
+        тело, имя = export.dossier(conn, request.query, request.all_asked)
+        if not тело:
+            return Response(pages.oops("Не из чего собрать досье: нет ни сущности, "
+                                       "ни слов запроса.", theme), status="404 Not Found")
+        return Response(тело, kind="text/markdown; charset=utf-8", filename=имя)
     if request.path == "/состояние":
         return Response(pages.state_page(conn, theme))
     if request.path == "/сводка":
