@@ -134,12 +134,17 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
         bot = telegram.Bot(session)
         if not bot.ready:
             log.warning("TELEGRAM_BOT_TOKEN не задан: новости будут копиться в базе без рассылки")
+        # Выключенные в интерфейсе издания не опрашиваются вовсе: это
+        # настройка, а не фильтр выдачи.
+        живые = [code for code in codes if store.source_enabled(conn, code)]
+        if len(живые) != len(codes):
+            log.info("выключено в интерфейсе: %s", ", ".join(sorted(set(codes) - set(живые))))
         watchers = [
             asyncio.create_task(
                 watch.loop(session, sources.BY_CODE[code], conn, stop, queue, rounds),
                 name="сторож-{}".format(code),
             )
-            for code in codes
+            for code in живые
         ]
         sender = asyncio.create_task(
             dispatch(bot, conn, queue, stop, done, session, budget), name="рассылка"
