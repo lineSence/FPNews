@@ -81,7 +81,7 @@ def similar(conn: Any, item_id: int, limit: int = 8, days: int = 30,
     rows = conn.execute(
         "SELECT i.id, i.title, i.url, i.source, i.published_at, i.listed_at, i.dup_of, v.vec "
         "FROM vectors v JOIN items i ON i.id = v.item_id WHERE v.model = ? AND i.id != ? "
-        "AND COALESCE(i.published_at, i.listed_at) >= datetime('now', ?) "
+        "AND julianday(COALESCE(i.published_at, i.listed_at)) >= julianday('now', ?) "
         "ORDER BY i.id DESC LIMIT ?",
         (embed.name(), int(item_id), "-{} days".format(int(days)), int(scan)),
     ).fetchall()
