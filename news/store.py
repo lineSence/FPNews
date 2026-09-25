@@ -110,6 +110,26 @@ SCHEMA = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS invites (
+        id          INTEGER PRIMARY KEY,
+        fingerprint TEXT NOT NULL UNIQUE,      -- blake2b(ключ, key=секрет), не ключ
+        note        TEXT NOT NULL DEFAULT '',  -- кому выдано, словами
+        role        TEXT NOT NULL DEFAULT 'читатель',
+        issued_at   TEXT NOT NULL,
+        expires_at  TEXT NOT NULL,
+        used_at     TEXT,
+        used_by     INTEGER,                   -- id того, кто вошёл по ключу
+        revoked_at  TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS settings (
+        key        TEXT PRIMARY KEY,           -- служебные значения самой системы
+        value      TEXT NOT NULL DEFAULT '',
+        updated_at TEXT
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS login_codes (
         code       TEXT PRIMARY KEY,           -- одноразовый, пять минут
         user_id    INTEGER NOT NULL,
@@ -221,6 +241,11 @@ LATE_COLUMNS = (
     # личка, иначе номер канала или группы.
     ("users", "delay", "INTEGER NOT NULL DEFAULT 0"),
     ("users", "target", "TEXT NOT NULL DEFAULT ''"),
+    # Шаг 15: роль. Пусто — человека у нас нет: раньше учётка заводилась
+    # каждому, кто написал боту, и это было ошибкой [CORE-016]. Тем, кто уже
+    # записан в работающей базе, роль проставляет `ensure` ниже: отбирать
+    # доступ у своих при обновлении было бы сюрпризом.
+    ("users", "role", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -231,6 +256,11 @@ def ensure(conn: sqlite3.Connection) -> None:
         have = {row["name"] for row in conn.execute("PRAGMA table_info({})".format(table))}
         if column not in have:
             conn.execute("ALTER TABLE {} ADD COLUMN {} {}".format(table, column, kind))
+            if (table, column) == ("users", "role"):
+                # Ровно один раз, в момент появления колонки: все, кто уже
+                # пользовался ботом до введения приглашений, остаются
+                # читателями. Новые без приглашения не заведутся.
+                conn.execute("UPDATE users SET role = 'читатель' WHERE role = ''")
     conn.commit()
 
 
