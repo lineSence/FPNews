@@ -103,8 +103,8 @@ async def send_also(bot: Any, conn: sqlite3.Connection, item_id: int, original_i
             continue
         if not allowed(conn, hit.user_id, item.get("source")):
             continue
-        if not await bot.send(hit.user_id, also_message(item, original), preview=False,
-                              keyboard=enrich.keyboard(item_id)):
+        if not await bot.send(store.target_of(conn, hit.user_id), also_message(item, original),
+                              preview=False, keyboard=enrich.keyboard(item_id)):
             continue
         record(conn, item_id, hit.user_id, hit.topic_id, "тоже_написали")
         sent += 1
@@ -128,11 +128,33 @@ async def send_change(bot: Any, conn: sqlite3.Connection, item_id: int, text: st
         if already(conn, item_id, user_id, "изменение") or not wants(
                 conn, user_id, "изменение"):
             continue
-        if not await bot.send(user_id, text, preview=False):
+        if not await bot.send(store.target_of(conn, user_id), text, preview=False):
             continue
         record(conn, item_id, user_id, row["topic_id"], "изменение")
         sent += 1
     return sent
+
+
+def ready(conn: sqlite3.Connection, user_id: int, item_id: int) -> bool:
+    """Пришло ли время отдавать этому человеку (поле «задержка отдачи»).
+
+    Задержка нужна тем, кому важнее устоявшийся текст, чем минута форы:
+    первые минуты материал часто правят. Отсчёт идёт от времени публикации,
+    а если издание его не дало — от момента, когда мы увидели ссылку. Это
+    разные вещи, и подменять одно другим молча нельзя [NEWS-001].
+    """
+    минут = store.delay_of(conn, user_id)
+    if минут <= 0:
+        return True
+    # Сравниваем через `julianday`, а не строками: в базе время лежит в виде
+    # ISO с «T» и смещением, а `datetime('now')` даёт другой вид — текстовое
+    # сравнение молча врало бы [NEWS-001].
+    row = conn.execute(
+        "SELECT 1 FROM items WHERE id = ? AND "
+        "julianday(COALESCE(published_at, listed_at)) <= julianday('now', ?)",
+        (int(item_id), "-{} minutes".format(int(минут))),
+    ).fetchone()
+    return row is not None
 
 
 def wants(conn: sqlite3.Connection, user_id: int, kind: str) -> bool:
@@ -163,7 +185,10 @@ async def send_to(bot: Any, conn: sqlite3.Connection, item_id: int, user_id: int
     row = conn.execute("SELECT source FROM items WHERE id = ?", (int(item_id),)).fetchone()
     if row is not None and not allowed(conn, user_id, row["source"]):
         return 0
-    if not await bot.send(user_id, text, preview=False, keyboard=enrich.keyboard(item_id)):
+    if not ready(conn, user_id, item_id):
+        return 0
+    if not await bot.send(store.target_of(conn, user_id), text, preview=False,
+                          keyboard=enrich.keyboard(item_id)):
         return 0
     record(conn, item_id, user_id, None, kind)
     return 1
@@ -189,7 +214,10 @@ async def send_item(bot: Any, conn: sqlite3.Connection, item_id: int) -> int:
             continue
         if not allowed(conn, hit.user_id, item.get("source")):
             continue
-        if not await bot.send(hit.user_id, message(item, hit),
+        if not ready(conn, hit.user_id, item_id):
+            # Ещё рано: досылкой займётся контур отложенной отдачи.
+            continue
+        if not await bot.send(store.target_of(conn, hit.user_id), message(item, hit),
                               keyboard=enrich.keyboard(item_id)):
             continue
         record(conn, item_id, hit.user_id, hit.topic_id, "сырое")
@@ -232,5 +260,6 @@ def record(conn: sqlite3.Connection, item_id: int, user_id: int, topic_id: int, 
         pass
 
 
-__all__ = ("LABEL", "NOTICE", "allowed", "already", "also_message", "message", "record", "send_also",
+__all__ = ("LABEL", "NOTICE", "allowed", "already", "also_message", "message", "ready",
+           "record", "send_also",
            "send_change", "send_item", "send_to", "subscribers", "wants")
