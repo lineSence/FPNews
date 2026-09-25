@@ -20,8 +20,8 @@ from typing import Any
 
 import diag
 
-from . import (article, dedup, deliver, digest, entities, fetch, model, queries, recheck,
-               sources, store, story, telegram, web)
+from . import (article, bridge, dedup, deliver, digest, entities, fetch, hold, model,
+               queries, recheck, sources, store, story, telegram, web)
 
 log = logging.getLogger("fpnews")
 
@@ -168,6 +168,10 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
             queries.loop(bot, conn, stop), name="сохранённые-запросы"
         )
         digester = asyncio.create_task(digest.loop(bot, conn, stop), name="сводки")
+        # Проверки связи из интерфейса: веб только кладёт просьбу, в сеть
+        # ходит этот контур [NEWS-002].
+        связной = asyncio.create_task(bridge.loop(bot, conn, stop), name="проверка-связи")
+        терпеливый = asyncio.create_task(hold.loop(bot, conn, stop), name="отложенная-отдача")
         try:
             await asyncio.gather(*watchers)
         except asyncio.CancelledError:  # pragma: no cover — снаружи
@@ -178,6 +182,8 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
         changes = await keeper
         found = await asker
         digests = await digester
+        проверок = await связной
+        отложенных = await терпеливый
         site.cancel()
         if talker is not None:
             stop.set()
@@ -187,6 +193,8 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
     summary["досылок_об_изменениях"] = changes
     summary["по_сохранённым_запросам"] = found
     summary["сводок"] = digests
+    summary["проверок_связи"] = проверок
+    summary["отложенных_отдач"] = отложенных
     summary["вызовов_модели"] = budget.calls
     if budget.embeds:
         summary["векторов"] = budget.embeds
