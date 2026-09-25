@@ -109,11 +109,13 @@ MENU = (
         ("/сущности", "Кто и что"),
         ("/всплески", "Всплески"),
         ("/задержки", "Задержки"),
+        ("/сводка", "Сводка"),
     )),
     ("Настройка", (
         ("/источники", "Источники"),
         ("/телеграм", "Отдача в Telegram"),
         ("/запросы", "Сохранённые запросы"),
+        ("/состояние", "Состояние"),
     )),
 )
 
@@ -442,6 +444,10 @@ def stream_page(conn: Any, user_id: int, query: dict[str, str], theme: str = "с
                 куски.append("<h2>{} — {}</h2>".format(html.escape(name), len(group)))
             куски.append("<ul>{}</ul>".format(
                 "".join(_stream_row(row) for row in group)))
+    куски.append(
+        '<p class=тихо>Выгрузить: <a href="{csv}">CSV</a> · <a href="{json}">JSON</a></p>'.format(
+            csv=stream.link(flt, формат="csv").replace("/лента?", "/выгрузка?"),
+            json=stream.link(flt, формат="json").replace("/лента?", "/выгрузка?")))
     шаги = []
     if flt.page > 1:
         шаги.append('<a href="{}">назад</a>'.format(stream.link(flt, стр=flt.page - 1)))
@@ -542,7 +548,34 @@ def item_page(conn: Any, raw_id: Any, theme: str = "система") -> str | No
             int(card["id"]), len(card["сюжет"]["участники"]))
     else:
         plot = "<p class=тихо>Других изданий по этому событию мы не видели.</p>"
-    return page("Материал", head + gone + lead + plot + revisions + copies, theme, "/поиск")
+    близкие = _similar_block(conn, int(card["id"]))
+    return page("Материал", head + gone + lead + plot + близкие + revisions + copies,
+                theme, "/поиск")
+
+
+def _similar_block(conn: Any, item_id: int) -> str:
+    """Похожие по смыслу. Пусто — вектора нет, а не «похожих не бывает».
+
+    Вектор считается только для новостей, которые кому-то ушли: тратить квоту
+    на то, чего никто не видел, мы не будем [CORE-016]. Так что отсутствие
+    блока — это про нас, и так и написано [NEWS-001].
+    """
+    from . import story as story_module  # noqa: PLC0415
+
+    строки = [row for row in story_module.similar(conn, item_id) if row["похожесть"] >= 0.55]
+    if not строки:
+        return ""
+    пункты = "".join(
+        '<li><a href="/материал?id={id}">{title}</a> '
+        '<span class=тихо>{source} · {when} · близость {score}</span></li>'.format(
+            id=int(row["id"]), title=html.escape(str(row["заголовок"] or "без заголовка")),
+            source=label(row["источник"]), when=when(row["когда"]), score=row["похожесть"])
+        for row in строки
+    )
+    return ("<h2>Похожие по смыслу</h2><ul>{}</ul>"
+            "<p class=тихо>Близость считается по векторам, которые у нас уже есть. Это "
+            "подсказка для человека, а не утверждение, что речь об одном событии "
+            "[NEWS-008].</p>").format(пункты)
 
 
 def _revision_block(card: dict[str, Any]) -> str:
@@ -939,6 +972,66 @@ def bursts_page(conn: Any, theme: str = "система") -> str:
                 "остаётся за человеком [NEWS-008].</p>", theme, "/всплески")
 
 
+def digest_page(conn: Any, user_id: int, mark: str, theme: str = "система") -> str:
+    """Сводка: как она выглядит сейчас и во сколько присылать."""
+    from . import digest as digest_module  # noqa: PLC0415
+
+    data = digest_module.collect(conn, user_id)
+    row = conn.execute("SELECT digest_at, digest_on FROM users WHERE id = ?",
+                       (int(user_id),)).fetchone()
+    когда = str((row["digest_at"] if row else "") or "")
+    форма = (
+        '<form class=строка method=post action="/сводка/время">'
+        '<input type=hidden name=метка value="{mark}">'
+        'присылать каждый день в <input type=text name=время value="{когда}" size=5 '
+        'placeholder="09:00">'
+        "<button>Сохранить</button></form>"
+        '<p class=тихо>Пустое поле — сводку не присылать. Последняя отправка: {было}.</p>'
+    ).format(mark=mark, когда=html.escape(когда, quote=True),
+             было=html.escape(str((row["digest_on"] if row else "") or "не было")))
+    предпросмотр = digest_module.text(data).replace("\n", "<br>")
+    return page("Сводка", форма +
+                "<h2>Как это выглядит сейчас</h2><div class=панель>{}</div>".format(предпросмотр) +
+                "<p class=тихо>Сводка отвечает на вопрос «что я пропустил», а не заменяет "
+                "срочные сообщения: сырое по-прежнему уходит сразу [NEWS-003].</p>",
+                theme, "/сводка")
+
+
+def state_page(conn: Any, theme: str = "система") -> str:
+    """Состояние: кто молчит, сколько весит база, что внутри."""
+    здоровье = store.source_health(conn)
+    размеры = store.sizes(conn)
+    строки = "".join(
+        "<tr><td>{name}</td><td>{всего}</td><td>{последний}</td><td>{назад} ч</td>"
+        "<td>{обычно} ч</td><td>{вывод}</td></tr>".format(
+            name=label(row["код"]), всего=row["всего"], последний=when(row["последний"]),
+            назад=row["часов_назад"], обычно=row["обычно_часов"] or "—",
+            вывод='<span class=снято>молчит дольше обычного</span>' if row["молчит"] else "ровно")
+        for row in здоровье
+    )
+    таблица = ("<table><tr><th>издание</th><th>за месяц</th><th>последний</th>"
+               "<th>назад</th><th>обычный промежуток</th><th></th></tr>{}</table>").format(
+        строки or "<tr><td colspan=6 class=тихо>за месяц мы ничего не видели</td></tr>")
+    объёмы = "".join(
+        "<tr><td>{}</td><td>{}</td></tr>".format(html.escape(name), value)
+        for name, value in (
+            ("файл базы, КБ", размеры["база_кб"]),
+            ("копии страниц сжатые, КБ", размеры["копии_кб"]),
+            ("копии страниц исходные, КБ", размеры["копии_исходно_кб"]),
+        )
+    )
+    счёт = "".join(
+        "<tr><td>{}</td><td>{}</td></tr>".format(html.escape(name), value)
+        for name, value in размеры["строк"].items()
+    )
+    return page("Состояние", таблица +
+                "<p class=тихо>«Молчит» — это про наши наблюдения, а не про издание: "
+                "возможно, оно пишет, а мы не видим [NEWS-001]. Сравниваем с его же "
+                "обычным промежутком за месяц, а не с выдуманной нормой.</p>"
+                "<h2>Объём</h2><table>{}</table><h2>Строк в таблицах</h2><table>{}</table>"
+                .format(объёмы, счёт), theme, "/состояние")
+
+
 def copy_page(conn: Any, raw_id: Any) -> str | None:
     """Сохранённая копия страницы как есть. `None` — такой копии нет."""
     try:
@@ -995,6 +1088,7 @@ def link_message(url: str) -> str:
 
 
 __all__ = ("MENU", "PER_PAGE", "STYLE", "THEMES", "bursts_page", "changes_page", "copy_page",
+           "digest_page", "state_page",
            "entities_page", "entity_page", "feed", "stream_page",
            "home", "item_page", "label", "lag", "latency", "link_message", "login", "oops",
            "page", "queries_page", "search_page", "sidebar", "sources_page", "story_page",
