@@ -331,6 +331,8 @@ def route(conn: Any, request: Request) -> Response:
         return redirect(safe_back(request.query.get("откуда", "/")), theme_cookie(chosen))
     if request.path == "/":
         return Response(pages.home(conn, user_id, csrf(token), theme))
+    if request.path == "/темы":
+        return Response(pages.topics_page(conn, user_id, csrf(token), theme))
     if request.path == "/задержки":
         return Response(pages.latency(conn, theme))
     if request.path == "/лента":
