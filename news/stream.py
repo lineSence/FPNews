@@ -34,6 +34,9 @@ PERIOD_DAYS = dict(PERIODS)
 # Потолок строк на страницу: одно ядро и человек, который столько не прочтёт.
 PER_PAGE = 50
 MAX_ROWS = 200
+# Потолок номера страницы. Без него «стр=99999999999999999999» из чужой
+# ссылки уходит в SQLite числом, которое туда не влезает, и страница падает.
+MAX_PAGE = 1000
 
 ORDER = {
     "новые сверху": "COALESCE(i.published_at, i.listed_at) DESC, i.id DESC",
@@ -64,7 +67,7 @@ class Filter:
 
     @property
     def offset(self) -> int:
-        return (max(1, self.page) - 1) * PER_PAGE
+        return (min(MAX_PAGE, max(1, self.page)) - 1) * PER_PAGE
 
 
 def read(query: dict[str, str], many: Any = None) -> Filter:
@@ -80,11 +83,11 @@ def read(query: dict[str, str], many: Any = None) -> Filter:
     group = str(query.get("папки", "") or "")
     period = str(query.get("период", "") or "")
     try:
-        page = max(1, int(str(query.get("стр", "1") or "1")))
+        page = min(MAX_PAGE, max(1, int(str(query.get("стр", "1") or "1"))))
     except ValueError:
         page = 1
     try:
-        topic_id = int(str(query.get("тема", "0") or "0"))
+        topic_id = max(0, min(2**31, int(str(query.get("тема", "0") or "0"))))
     except ValueError:
         topic_id = 0
     return Filter(
@@ -272,5 +275,5 @@ def _by_topic(conn: Any, rows: list[dict[str, Any]],
     return pairs
 
 
-__all__ = ("GROUPS", "MAX_ROWS", "ORDER", "PERIODS", "PERIOD_DAYS", "PER_PAGE", "SORTS",
+__all__ = ("GROUPS", "MAX_PAGE", "MAX_ROWS", "ORDER", "PERIODS", "PERIOD_DAYS", "PER_PAGE", "SORTS",
            "Filter", "folders", "link", "read", "select")
