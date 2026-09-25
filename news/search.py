@@ -196,19 +196,25 @@ def _row(row: sqlite3.Row) -> dict[str, Any]:
 def item(conn: sqlite3.Connection, item_id: int) -> dict[str, Any] | None:
     """Материал, его правки и сюжет, в который он входит.
 
-    Тексты ревизий мы пока не храним, поэтому история — это «когда, какой
-    заголовок, какая длина». Дифф появится, когда появятся тексты.
+    С шага 10 в каждой правке лежит и текст той редакции, поэтому страница
+    показывает не только «когда и какой длины», но и что именно убрали
+    [NEWS-008]. Снятие с публикации — отдельные поля: это наблюдение, а не
+    отсутствие данных [NEWS-001].
     """
     row = conn.execute(
         "SELECT id, url, source, title, lead, body, published_at, listed_at, "
-        "fetched_at, sent_at, dup_of, checks FROM items WHERE id = ?",
+        "fetched_at, sent_at, dup_of, checks, gone_at, gone_code FROM items WHERE id = ?",
         (item_id,),
     ).fetchone()
     if row is None:
         return None
     revisions = conn.execute(
-        "SELECT seen_at, title, length FROM item_revisions WHERE item_id = ? "
+        "SELECT id, seen_at, title, length, text FROM item_revisions WHERE item_id = ? "
         "ORDER BY seen_at",
+        (item_id,),
+    ).fetchall()
+    copies = conn.execute(
+        "SELECT id, taken_at, sha256, size FROM snapshots WHERE item_id = ? ORDER BY taken_at",
         (item_id,),
     ).fetchall()
     return {
@@ -224,9 +230,17 @@ def item(conn: sqlite3.Connection, item_id: int) -> dict[str, Any] | None:
         "отправлено": row["sent_at"],
         "перепечатка_из": row["dup_of"],
         "перечитаний": int(row["checks"]),
+        "снято": row["gone_at"],
+        "код_снятия": row["gone_code"],
         "правки": [
-            {"когда": rev["seen_at"], "заголовок": rev["title"], "длина": int(rev["length"])}
+            {"id": int(rev["id"]), "когда": rev["seen_at"], "заголовок": rev["title"],
+             "длина": int(rev["length"]), "текст": rev["text"] or ""}
             for rev in revisions
+        ],
+        "копии": [
+            {"id": int(copy["id"]), "когда": copy["taken_at"], "отпечаток": copy["sha256"],
+             "размер": int(copy["size"])}
+            for copy in copies
         ],
         "сюжет": story(conn, item_id),
     }
