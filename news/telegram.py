@@ -33,8 +33,10 @@ def hush() -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
-# Адрес метода Bot API. Фигурные скобки здесь — подстановка, а не текст.
-API = "https://api.telegram.org/bot{token}/{method}"
+# Адрес метода Bot API собирается из двух частей: хост без подстановок,
+# хвост с полями `format`. Раздельно — чтобы скобки в адресе было видно глазом.
+HOST = "https://api.telegram.org"
+API = HOST + "/bot{token}/{method}"
 # На случай, если в тексте ошибки окажется чужой или старый токен.
 TOKEN_RE = re.compile(r"bot\d{6,}:[A-Za-z0-9_-]{20,}")
 # Телеграм режет сообщения на 4096 символах; оставляем запас на разметку.
@@ -119,4 +121,4 @@ class Bot:
         return result
 
 
-__all__ = ("API", "Bot", "MAX_TEXT", "hush", "safe", "token")
+__all__ = ("API", "Bot", "HOST", "MAX_TEXT", "hush", "safe", "token")
