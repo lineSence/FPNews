@@ -59,14 +59,14 @@ def test_темы_добавляются_и_удаляются_через_веб
     conn = _db(tmp_path)
     token = web.new_session(conn, 7)
     mark = web.csrf(token)
-    home = _get(conn, "/", token)
-    assert "Тем пока нет" in home.body
+    главная = _get(conn, "/темы", token)
+    assert "Тем пока нет" in главная.body
     added = _post(conn, "/темы/добавить", token, "метка={}&слова=дроны%2C+бпла".format(mark))
     assert added.status.startswith("303")
-    assert "дроны" in _get(conn, "/", token).body
+    assert "дроны" in _get(conn, "/темы", token).body
     number = conn.execute("SELECT id FROM topics WHERE user_id = 7").fetchone()["id"]
     _post(conn, "/темы/удалить", token, "метка={}&номер={}".format(mark, number))
-    assert "Тем пока нет" in _get(conn, "/", token).body
+    assert "Тем пока нет" in _get(conn, "/темы", token).body
 
 
 def test_форма_без_метки_отбивается(tmp_path: Path) -> None:
@@ -82,7 +82,7 @@ def test_чужие_темы_не_видны(tmp_path: Path) -> None:
     conn = _db(tmp_path)
     bot_module.ensure_user(conn, 9, "Другой")
     bot_module.add_topic(conn, 9, "секретная тема")
-    body = _get(conn, "/", web.new_session(conn, 7)).body
+    body = _get(conn, "/темы", web.new_session(conn, 7)).body
     assert "секретная" not in body
 
 
