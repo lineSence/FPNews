@@ -63,7 +63,9 @@ class Budget:
     """
 
     max_calls: int = 0
+    max_embeds: int = 0
     calls: int = 0
+    embeds: int = 0
     failures: int = 0
     cached: int = 0
     day: str = ""
@@ -72,12 +74,15 @@ class Budget:
     def __post_init__(self) -> None:
         if not self.max_calls:
             self.max_calls = int(os.getenv("FPNEWS_LLM_MAX_CALLS") or 200)
+        if not self.max_embeds:
+            self.max_embeds = int(os.getenv("FPNEWS_EMBED_MAX_CALLS") or 2000)
         self.day = str(date.today())
 
     def _roll(self) -> None:
         today = str(date.today())
         if today != self.day:
             self.day, self.calls, self.failures, self.cached = today, 0, 0, 0
+            self.embeds = 0
             self.dropped.clear()
 
     def take(self) -> bool:
@@ -86,6 +91,15 @@ class Budget:
         if self.calls >= self.max_calls:
             return False
         self.calls += 1
+        return True
+
+    def take_embed(self) -> bool:
+        """Занять вектор. Счётчик отдельный: вектор дешевле ответа в разы,
+        и общий потолок либо душил бы склейку, либо не держал бы чат."""
+        self._roll()
+        if self.embeds >= self.max_embeds:
+            return False
+        self.embeds += 1
         return True
 
     def drop(self, model: str, why: str) -> None:

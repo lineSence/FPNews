@@ -20,7 +20,7 @@ from typing import Any
 
 import diag
 
-from . import article, dedup, deliver, fetch, model, sources, store, telegram
+from . import article, dedup, deliver, fetch, model, recheck, sources, store, story, telegram
 
 log = logging.getLogger("fpnews")
 
@@ -48,7 +48,8 @@ def report(conn: Any, limit: int = 200) -> dict[str, Any]:
     return out
 
 
-async def handle(bot: Any, session: Any, conn: Any, item_id: int) -> int:
+async def handle(bot: Any, session: Any, conn: Any, item_id: int,
+                 budget: Any = None) -> int:
     """Путь одной новости после сторожа.
 
     Порядок здесь и есть главное решение проекта: сырое сообщение уходит по
@@ -71,6 +72,11 @@ async def handle(bot: Any, session: Any, conn: Any, item_id: int) -> int:
                                                            item.get("body") or ""))
     item = dict(conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone())
     original = dedup.find(conn, item)
+    if not original and sent and budget is not None:
+        # Точная склейка промолчала. Смысловая стоит вызова модели, поэтому
+        # идём в неё только ради новости, которую кто-то получил [CORE-016].
+        match = await story.link(session, conn, item, budget)
+        original = match.item_id if match else None
     if original:
         store.mark_dup(conn, item_id, original)
         sent += await deliver.send_also(bot, conn, item_id, original)
@@ -82,7 +88,7 @@ async def handle(bot: Any, session: Any, conn: Any, item_id: int) -> int:
 
 
 async def dispatch(bot: Any, conn: Any, queue: "asyncio.Queue[int]", stop: Any, done: Any,
-                   session: Any = None) -> int:
+                   session: Any = None, budget: Any = None) -> int:
     """Контур рассылки: берёт новость из очереди и отдаёт подписчикам.
 
     Отдельная задача, а не часть сторожа: медленный Telegram не имеет права
@@ -97,7 +103,7 @@ async def dispatch(bot: Any, conn: Any, queue: "asyncio.Queue[int]", stop: Any, 
                 return sent
             continue
         try:
-            sent += await handle(bot, session, conn, item_id)
+            sent += await handle(bot, session, conn, item_id, budget)
         except Exception as exc:  # noqa: BLE001 — рассылка не роняет сбор [CORE-017]
             log.warning("рассылка новости %s сорвалась: %s", item_id, exc)
 
@@ -131,7 +137,7 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
             for code in codes
         ]
         sender = asyncio.create_task(
-            dispatch(bot, conn, queue, stop, done, session), name="рассылка"
+            dispatch(bot, conn, queue, stop, done, session, budget), name="рассылка"
         )
         talker = (
             asyncio.create_task(
@@ -141,18 +147,26 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
             if bot.ready
             else None
         )
+        keeper = asyncio.create_task(
+            recheck.loop(bot, session, conn, stop), name="перечитывание"
+        )
         try:
             await asyncio.gather(*watchers)
         except asyncio.CancelledError:  # pragma: no cover — снаружи
             stop.set()
         done.set()
         sent = await sender
+        stop.set()
+        summary_changes = await keeper
         if talker is not None:
             stop.set()
             talker.cancel()
     summary = report(conn)
     summary["разослано"] = sent
+    summary["досылок_об_изменениях"] = summary_changes
     summary["вызовов_модели"] = budget.calls
+    if budget.embeds:
+        summary["векторов"] = budget.embeds
     if budget.cached:
         summary["ответов_из_памяти"] = budget.cached
     summary["в_очереди_на_обработку"] = queue.qsize()

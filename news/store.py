@@ -40,7 +40,9 @@ SCHEMA = (
         sent_at       TEXT,                   -- ушло сырое сообщение
         enriched_at   TEXT,                   -- ушло дополнение
         cold          INTEGER NOT NULL DEFAULT 0, -- подобрано на холодном старте
-        dup_of        INTEGER                     -- id новости, о которой уже писали
+        dup_of        INTEGER,                    -- id новости, о которой уже писали
+        checked_at    TEXT,                       -- когда последний раз перечитывали
+        checks        INTEGER NOT NULL DEFAULT 0  -- сколько раз перечитали
     )
     """,
     "CREATE INDEX IF NOT EXISTS items_listed ON items(listed_at)",
@@ -91,6 +93,15 @@ SCHEMA = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS vectors (
+        item_id    INTEGER NOT NULL,
+        model      TEXT NOT NULL,              -- имя модели живёт рядом [LLM-011]
+        vec        BLOB NOT NULL,              -- нормированные float32
+        created_at TEXT NOT NULL,
+        UNIQUE(item_id, model)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS enrichments (
         item_id    INTEGER NOT NULL,
         kind       TEXT NOT NULL,              -- выжимка | цитата | оценка
@@ -119,9 +130,21 @@ def connect(path: str | Path = DEFAULT_PATH) -> sqlite3.Connection:
     return conn
 
 
+# Колонки, добавленные после того, как база уже работала на сервере.
+# `CREATE TABLE IF NOT EXISTS` их не добавит — нужен явный ALTER.
+LATE_COLUMNS = (
+    ("items", "checked_at", "TEXT"),
+    ("items", "checks", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
 def ensure(conn: sqlite3.Connection) -> None:
     for statement in SCHEMA:
         conn.execute(statement)
+    for table, column, kind in LATE_COLUMNS:
+        have = {row["name"] for row in conn.execute("PRAGMA table_info({})".format(table))}
+        if column not in have:
+            conn.execute("ALTER TABLE {} ADD COLUMN {} {}".format(table, column, kind))
     conn.commit()
 
 
@@ -292,5 +315,66 @@ def save_enrichment(conn: sqlite3.Connection, item_id: int, kind: str, text: str
     )
     conn.commit()
 
-__all__ = ("CACHE_KB", "DEFAULT_PATH", "SCHEMA", "STAMPS", "connect", "ensure", "fill",
-           "enrichment", "latency_of", "latency_rows", "mark_dup", "now", "published", "remember", "save_enrichment", "set_fingerprint", "stamp")
+def vector_of(conn: sqlite3.Connection, item_id: int, model: str) -> bytes:
+    """Вектор новости этой моделью. Чужой моделью — как будто его нет."""
+    row = conn.execute(
+        "SELECT vec FROM vectors WHERE item_id = ? AND model = ?", (item_id, model)
+    ).fetchone()
+    return bytes(row["vec"]) if row is not None else b""
+
+
+def save_vector(conn: sqlite3.Connection, item_id: int, model: str, vec: bytes) -> None:
+    conn.execute(
+        "INSERT INTO vectors(item_id, model, vec, created_at) VALUES(?,?,?,?) "
+        "ON CONFLICT(item_id, model) DO UPDATE SET vec = excluded.vec",
+        (item_id, model, vec, now()),
+    )
+    conn.commit()
+
+
+def neighbours(conn: sqlite3.Connection, item_id: int, model: str,
+               hours: int = 12, limit: int = 300) -> list[dict[str, Any]]:
+    """Соседи с векторами за окно: кандидаты на «тоже написали».
+
+    Берём только те, что кому-то ушли: у остальных вектора и нет — считать
+    его было бы тратой квоты на новость, которой никто не видел [CORE-016].
+    """
+    rows = conn.execute(
+        "SELECT i.id, i.title, i.url, i.source, v.vec FROM items i "
+        "JOIN vectors v ON v.item_id = i.id AND v.model = ? "
+        "WHERE i.id != ? AND i.dup_of IS NULL AND i.cold = 0 "
+        "AND i.listed_at >= datetime('now', ?) ORDER BY i.id DESC LIMIT ?",
+        (model, item_id, "-{} hours".format(int(hours)), int(limit)),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def revise(conn: sqlite3.Connection, item_id: int, title: str, length: int,
+           digest: str) -> None:
+    """Запись о том, как материал выглядел в этот момент."""
+    conn.execute(
+        "INSERT INTO item_revisions(item_id, seen_at, title, length, digest) "
+        "VALUES(?,?,?,?,?)",
+        (item_id, now(), title, int(length), digest),
+    )
+    conn.commit()
+
+
+def last_revision(conn: sqlite3.Connection, item_id: int) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT title, length, digest, seen_at FROM item_revisions "
+        "WHERE item_id = ? ORDER BY id DESC LIMIT 1",
+        (item_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def mark_checked(conn: sqlite3.Connection, item_id: int) -> None:
+    conn.execute(
+        "UPDATE items SET checked_at = ?, checks = checks + 1 WHERE id = ?",
+        (now(), item_id),
+    )
+    conn.commit()
+
+__all__ = ("CACHE_KB", "DEFAULT_PATH", "LATE_COLUMNS", "SCHEMA", "STAMPS", "connect", "ensure", "fill",
+           "enrichment", "last_revision", "latency_of", "latency_rows", "mark_checked", "mark_dup", "neighbours", "now", "published", "remember", "save_enrichment", "revise", "save_vector", "set_fingerprint", "stamp", "vector_of")

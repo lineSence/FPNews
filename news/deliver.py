@@ -101,6 +101,29 @@ async def send_also(bot: Any, conn: sqlite3.Connection, item_id: int, original_i
     return sent
 
 
+async def send_change(bot: Any, conn: sqlite3.Connection, item_id: int, text: str) -> int:
+    """Досылка об изменении — только тем, кто получил первую версию.
+
+    Остальным это не изменение, а новость, и она уйдёт обычным путём. Вид
+    отправки свой (`изменение`), поэтому база не спутает её с сырым
+    сообщением и не заблокирует ни то ни другое.
+    """
+    rows = conn.execute(
+        "SELECT user_id, topic_id FROM deliveries WHERE item_id = ? AND kind = 'сырое'",
+        (item_id,),
+    ).fetchall()
+    sent = 0
+    for row in rows:
+        user_id = int(row["user_id"])
+        if already(conn, item_id, user_id, "изменение"):
+            continue
+        if not await bot.send(user_id, text, preview=False):
+            continue
+        record(conn, item_id, user_id, row["topic_id"], "изменение")
+        sent += 1
+    return sent
+
+
 async def send_item(bot: Any, conn: sqlite3.Connection, item_id: int) -> int:
     """Разослать одну новость всем, чьи темы сработали. Вернуть число отправок."""
     row = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
@@ -163,4 +186,4 @@ def record(conn: sqlite3.Connection, item_id: int, user_id: int, topic_id: int, 
 
 
 __all__ = ("LABEL", "already", "also_message", "message", "record", "send_also",
-           "send_item", "subscribers")
+           "send_change", "send_item", "subscribers")
