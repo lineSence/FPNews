@@ -162,7 +162,8 @@ def select(conn: Any, flt: Filter) -> list[dict[str, Any]]:
         params.extend(codes)
     days = PERIOD_DAYS.get(flt.period, 0)
     if days and not (flt.since or flt.until):
-        where.append("COALESCE(i.published_at, i.listed_at) >= datetime('now', ?)")
+        where.append("julianday(COALESCE(i.published_at, i.listed_at)) "
+                     ">= julianday('now', ?)")
         params.append("-{} days".format(int(days)))
     if flt.since:
         where.append("date(COALESCE(i.published_at, i.listed_at)) >= date(?)")
