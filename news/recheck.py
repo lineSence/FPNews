@@ -42,7 +42,8 @@ def due(conn: Any, limit: int = 20) -> list[dict[str, Any]]:
     rows = conn.execute(
         "SELECT id, url, title, body, checks, listed_at, checked_at, gone_at FROM items "
         "WHERE cold = 0 AND sent_at IS NOT NULL AND checks < ? "
-        "AND listed_at >= datetime('now', '-1 day') ORDER BY listed_at DESC LIMIT ?",
+        "AND julianday(listed_at) >= julianday('now', '-1 day') "
+        "ORDER BY listed_at DESC LIMIT ?",
         (len(STEPS), int(limit * 4)),
     ).fetchall()
     out: list[dict[str, Any]] = []
