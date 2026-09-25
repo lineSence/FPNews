@@ -6,21 +6,24 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=fpnews
+# Рабочая папка — дом пользователя, а не репозиторий: база и секреты лежат
+# рядом с кодом, но вне его, и `git pull` их не трогает.
 WorkingDirectory=/opt/fpnews
+Environment=PYTHONPATH=/opt/fpnews/app
+Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/opt/fpnews/.env
-ExecStart=/opt/fpnews/.venv/bin/python -m news.run
+ExecStart=/opt/fpnews/app/.venv/bin/python -m news.run
 Restart=always
 RestartSec=5
 # Сервер маленький: если процесс раздулся, лучше перезапуск, чем вытеснение
 # соседних сервисов в swap.
 MemoryMax=320M
 MemorySwapMax=128M
-# Жёсткость по мелочи: писать можно только в свою папку.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
-ReadWritePaths=/opt/fpnews/data
+ReadWritePaths=/opt/fpnews
 
 [Install]
 WantedBy=multi-user.target

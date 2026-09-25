@@ -12,32 +12,51 @@ sudo apt install -y python3 python3-venv git sqlite3
 python3 -V   # нужен 3.11 или новее
 ```
 
-## 2. Пользователь и код
+## 2. Пользователь и папки
 
-Отдельный пользователь без входа в систему — чтобы сервис не ходил под root.
+Раскладка такая: дом пользователя `/opt/fpnews`, код в подпапке `app`, а база
+и секреты рядом с ним, но **вне репозитория** — тогда `git pull` их не трогает.
 
 ```bash
 sudo useradd --system --home /opt/fpnews --shell /usr/sbin/nologin fpnews
-sudo mkdir -p /opt/fpnews && sudo chown fpnews: /opt/fpnews
-
-sudo -u fpnews git clone https://github.com/lineSence/FPNews.git /opt/fpnews
-cd /opt/fpnews
-sudo -u fpnews python3 -m venv .venv
-sudo -u fpnews .venv/bin/pip install -U pip
-sudo -u fpnews .venv/bin/pip install -r requirements-news.txt
+sudo mkdir -p /opt/fpnews/.ssh /opt/fpnews/data
+sudo chown -R fpnews: /opt/fpnews
+sudo chmod 700 /opt/fpnews/.ssh
 ```
 
-Репозиторий приватный, поэтому клонирование спросит доступ. Проще всего —
-ключ развёртывания: `ssh-keygen -t ed25519 -f ~/.ssh/fpnews_deploy`, публичную
-часть добавить в настройках репозитория (Settings → Deploy keys, только
-чтение), и клонировать по SSH-адресу.
+Каждая команда `sudo -u fpnews` дальше идёт с `env HOME=/opt/fpnews`: без этого
+git и ssh полезут в `/root` и получат отказ по правам.
 
-## 3. Секреты
+## 3. Доступ к приватному репозиторию
+
+Ключ развёртывания: он даёт доступ только к этому репозиторию и только на
+чтение — в отличие от личного токена, который открывает всё сразу.
 
 ```bash
-sudo -u fpnews tee /opt/fpnews/.env >/dev/null <<'ENV'
-TELEGRAM_BOT_TOKEN=123456:AA...
-ENV
+sudo -u fpnews env HOME=/opt/fpnews ssh-keygen -t ed25519 -N '' \
+  -f /opt/fpnews/.ssh/id_ed25519 -C 'fpnews@vps'
+sudo cat /opt/fpnews/.ssh/id_ed25519.pub
+```
+
+Показанную строку добавить на <https://github.com/lineSence/FPNews/settings/keys>
+→ Add deploy key, галочку «Allow write access» **не** ставить. Затем:
+
+```bash
+sudo -u fpnews env HOME=/opt/fpnews \
+  git clone git@github.com:lineSence/FPNews.git /opt/fpnews/app
+```
+
+Первый раз ssh спросит про отпечаток github.com — ответить `yes`.
+
+## 4. Среда и секреты
+
+```bash
+cd /opt/fpnews/app
+sudo -u fpnews env HOME=/opt/fpnews python3 -m venv .venv
+sudo -u fpnews .venv/bin/pip install -U pip
+sudo -u fpnews .venv/bin/pip install -r requirements-news.txt
+
+printf 'TELEGRAM_BOT_TOKEN=%s\n' 'сюда_токен' | sudo -u fpnews tee /opt/fpnews/.env
 sudo chmod 600 /opt/fpnews/.env
 ```
 
@@ -45,12 +64,12 @@ sudo chmod 600 /opt/fpnews/.env
 Бота заводит @BotFather; домен для будущего входа в веб привязывается
 командой `/setdomain` → `mousehousespb.online`.
 
-## 4. Проверка до запуска службы
+## 5. Проверка до запуска службы
 
 Всё это безопасно гонять руками — ни одно из действий ничего не рассылает.
 
 ```bash
-cd /opt/fpnews
+cd /opt/fpnews/app
 sudo -u fpnews .venv/bin/python -m news.probe                 # обе двери, один заход
 sudo -u fpnews .venv/bin/python -m news.probe fontanka -n 20 -e 15
 ```
@@ -60,10 +79,10 @@ sudo -u fpnews .venv/bin/python -m news.probe fontanka -n 20 -e 15
 `коды` в итоговой сводке. Если появятся 403 — интервал увеличится сам
 `[NEWS-006]`, а в `docs/news-sources.md` надо будет записать новую цифру.
 
-## 5. Служба
+## 6. Служба
 
 ```bash
-sudo cp /opt/fpnews/deploy/fpnews.service /etc/systemd/system/
+sudo cp /opt/fpnews/app/deploy/fpnews.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now fpnews
 systemctl status fpnews
@@ -76,10 +95,11 @@ journalctl -u fpnews -f
 Обновление после изменений в репозитории:
 
 ```bash
-cd /opt/fpnews && sudo -u fpnews git pull && sudo systemctl restart fpnews
+sudo -u fpnews env HOME=/opt/fpnews git -C /opt/fpnews/app pull
+sudo systemctl restart fpnews
 ```
 
-## 6. Проверка через SSH-туннель
+## 7. Проверка через SSH-туннель
 
 Телеграму туннель не нужен: бот сам ходит наружу. Туннель нужен, чтобы
 смотреть на внутренности сервера, не открывая ни одного порта в интернет.
@@ -96,7 +116,7 @@ ssh -N -L 8765:127.0.0.1:8765 root@ВАШ_СЕРВЕР
 
 ```bash
 # как быстро доходят новости
-ssh root@ВАШ_СЕРВЕР 'cd /opt/fpnews && .venv/bin/python -m news.run --latency'
+ssh root@ВАШ_СЕРВЕР 'cd /opt/fpnews && PYTHONPATH=app app/.venv/bin/python -m news.run --latency'
 
 # что вообще собралось за последний час
 ssh root@ВАШ_СЕРВЕР "sqlite3 /opt/fpnews/data/fpnews.sqlite3 \
@@ -116,7 +136,7 @@ ssh root@ВАШ_СЕРВЕР "sqlite3 /opt/fpnews/data/fpnews.sqlite3 \
 scp root@ВАШ_СЕРВЕР:/tmp/fpnews-copy.sqlite3 .
 ```
 
-## 7. Сценарий первой проверки целиком
+## 8. Сценарий первой проверки целиком
 
 1. `systemctl status fpnews` — служба работает, в журнале холодный старт.
 2. В Telegram: `/старт`, затем `/добавить` со словами, которые точно встретятся
@@ -126,7 +146,7 @@ scp root@ВАШ_СЕРВЕР:/tmp/fpnews-copy.sqlite3 .
    процентиль по трём участкам пути.
 5. Через сутки повторить: цифры одного дня — ещё не измерение `[CORE-019]`.
 
-## 8. Если что-то не так
+## 9. Если что-то не так
 
 | Симптом | Где смотреть |
 |---|---|
@@ -134,4 +154,5 @@ scp root@ВАШ_СЕРВЕР:/tmp/fpnews-copy.sqlite3 .
 | Новостей нет совсем | `news.probe` — жива ли дверь; в журнале коды ответов |
 | Сообщения не приходят | токен в `.env`, в журнале «TELEGRAM_BOT_TOKEN не задан» |
 | Фонтанка отдаёт 403 | защита заметила частоту; увеличить `interval` источника в `news/sources.py` |
+| `Permission denied` при `sudo -u fpnews` | забыт `env HOME=/opt/fpnews` |
 | База растёт | `sqlite3 ... "SELECT COUNT(*) FROM items"`; чистка старого появится вместе с обогащением |
