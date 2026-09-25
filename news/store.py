@@ -117,6 +117,13 @@ SCHEMA = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS source_state (
+        code    TEXT PRIMARY KEY,               -- код издания из sources.py
+        enabled INTEGER NOT NULL DEFAULT 1,     -- опрашивать ли
+        every   INTEGER NOT NULL DEFAULT 0      -- свой интервал в секундах; 0 — как в коде
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS snapshots (
         id       INTEGER PRIMARY KEY,
         item_id  INTEGER NOT NULL,
@@ -183,6 +190,8 @@ LATE_COLUMNS = (
     ("item_revisions", "text", "TEXT NOT NULL DEFAULT ''"),
     ("items", "gone_at", "TEXT"),
     ("items", "gone_code", "INTEGER"),
+    # Какие виды сообщений человек согласен получать. Пусто — все.
+    ("users", "kinds", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -545,12 +554,100 @@ def drop_query(conn: sqlite3.Connection, query_id: int, user_id: int) -> bool:
     return cursor.rowcount > 0
 
 
+def toggle_notify(conn: sqlite3.Connection, query_id: int, user_id: int) -> bool:
+    """Переключает уведомления по запросу. Возвращает новое состояние.
+
+    Отдельная функция, а не «поставить значение», потому что кнопка в вебе
+    без JavaScript умеет только послать факт нажатия [CORE-025].
+    """
+    row = conn.execute(
+        "SELECT notify FROM saved_queries WHERE id = ? AND user_id = ?", (query_id, user_id)
+    ).fetchone()
+    if row is None:
+        return False
+    state = 0 if row["notify"] else 1
+    conn.execute("UPDATE saved_queries SET notify = ? WHERE id = ?", (state, query_id))
+    conn.commit()
+    return bool(state)
+
+
 def mark_query_seen(conn: sqlite3.Connection, query_id: int, last_item_id: int) -> None:
     """Запоминает, по какой материал запрос уже отдан. Назад не откатываем."""
     conn.execute(
         "UPDATE saved_queries SET last_item_id = MAX(last_item_id, ?) WHERE id = ?",
         (int(last_item_id), query_id),
     )
+    conn.commit()
+
+
+# Виды сообщений, которые можно выключить в интерфейсе. «Изменение» и
+# «запрос» намеренно в списке: человек вправе не хотеть досылок.
+KINDS = ("сырое", "дополнение", "изменение", "тоже_написали", "запрос")
+
+
+def source_states(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    """Состояние источников из базы. Чего нет в базе — включено по умолчанию."""
+    rows = conn.execute("SELECT code, enabled, every FROM source_state").fetchall()
+    return {
+        str(row["code"]): {"включён": bool(row["enabled"]), "интервал": int(row["every"] or 0)}
+        for row in rows
+    }
+
+
+def set_source(conn: sqlite3.Connection, code: str, *, enabled: bool | None = None,
+               every: int | None = None) -> None:
+    """Включить, выключить или задать свой интервал опроса издания."""
+    conn.execute("INSERT OR IGNORE INTO source_state(code) VALUES(?)", (code,))
+    if enabled is not None:
+        conn.execute("UPDATE source_state SET enabled = ? WHERE code = ?",
+                     (1 if enabled else 0, code))
+    if every is not None:
+        conn.execute("UPDATE source_state SET every = ? WHERE code = ?",
+                     (max(0, int(every)), code))
+    conn.commit()
+
+
+def source_enabled(conn: sqlite3.Connection, code: str) -> bool:
+    row = conn.execute("SELECT enabled FROM source_state WHERE code = ?", (code,)).fetchone()
+    return True if row is None else bool(row["enabled"])
+
+
+def source_every(conn: sqlite3.Connection, code: str) -> int:
+    """Свой интервал издания в секундах. 0 — брать тот, что в коде."""
+    row = conn.execute("SELECT every FROM source_state WHERE code = ?", (code,)).fetchone()
+    return int(row["every"] or 0) if row is not None else 0
+
+
+def kinds_of(conn: sqlite3.Connection, user_id: int) -> set[str]:
+    """Какие виды сообщений человек получает. Пустая настройка — все."""
+    row = conn.execute("SELECT kinds FROM users WHERE id = ?", (int(user_id),)).fetchone()
+    raw = str(row["kinds"]).strip() if row is not None and row["kinds"] else ""
+    if not raw:
+        return set(KINDS)
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def set_kinds(conn: sqlite3.Connection, user_id: int, kinds: Any) -> None:
+    """Сохраняет выбор видов. Все виды сразу сохраняются как «пусто»."""
+    chosen = [kind for kind in KINDS if kind in set(kinds or ())]
+    value = "" if len(chosen) == len(KINDS) else ",".join(chosen)
+    conn.execute("UPDATE users SET kinds = ? WHERE id = ?", (value, int(user_id)))
+    conn.commit()
+
+
+def set_quiet(conn: sqlite3.Connection, user_id: int, since: str, until: str) -> None:
+    """Тихие часы. Непонятное время не сохраняется, а не ломает настройку."""
+    import re  # noqa: PLC0415
+
+    clock = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
+    first = (since or "").strip()
+    second = (until or "").strip()
+    if first and not clock.match(first):
+        return
+    if second and not clock.match(second):
+        return
+    conn.execute("UPDATE users SET quiet_from = ?, quiet_to = ? WHERE id = ?",
+                 (first, second, int(user_id)))
     conn.commit()
 
 
@@ -561,9 +658,11 @@ def mark_checked(conn: sqlite3.Connection, item_id: int) -> None:
     )
     conn.commit()
 
-__all__ = ("CACHE_KB", "DEFAULT_PATH", "LATE_COLUMNS", "SCHEMA", "STAMPS", "add_query",
+__all__ = ("CACHE_KB", "DEFAULT_PATH", "KINDS", "LATE_COLUMNS", "SCHEMA", "STAMPS", "add_query",
            "connect", "drop_query", "ensure", "fill", "enrichment", "gone", "last_revision",
            "latency_of", "latency_rows", "mark_checked", "mark_dup", "mark_gone",
            "mark_query_seen", "neighbours", "now", "published", "queries", "remember",
            "revise", "revisions", "revive", "save_enrichment", "save_snapshot", "save_vector",
-           "set_fingerprint", "snapshot_page", "snapshots", "stamp", "vector_of")
+           "set_fingerprint", "set_kinds", "set_quiet", "set_source", "snapshot_page", "snapshots",
+           "source_enabled", "source_every", "source_states", "kinds_of", "stamp",
+           "toggle_notify", "vector_of")
