@@ -15,7 +15,8 @@ class FakeBot:
     def __init__(self) -> None:
         self.sent: list[tuple[int, str]] = []
 
-    async def send(self, chat_id: int, text: str, preview: bool = True) -> bool:
+    async def send(self, chat_id: int, text: str, preview: bool = True,
+                   keyboard: dict | None = None) -> bool:
         self.sent.append((chat_id, text))
         return True
 

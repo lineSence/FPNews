@@ -16,7 +16,7 @@ import logging
 import sqlite3
 from typing import Any
 
-from . import store, topics
+from . import enrich, store, topics
 
 log = logging.getLogger("fpnews.deliver")
 
@@ -93,7 +93,8 @@ async def send_also(bot: Any, conn: sqlite3.Connection, item_id: int, original_i
             continue  # обычную отправку сделает send_item
         if already(conn, item_id, hit.user_id, "тоже_написали"):
             continue
-        if not await bot.send(hit.user_id, also_message(item, original), preview=False):
+        if not await bot.send(hit.user_id, also_message(item, original), preview=False,
+                              keyboard=enrich.keyboard(item_id)):
             continue
         record(conn, item_id, hit.user_id, hit.topic_id, "тоже_написали")
         sent += 1
@@ -118,7 +119,8 @@ async def send_item(bot: Any, conn: sqlite3.Connection, item_id: int) -> int:
             continue
         if already(conn, item_id, hit.user_id, "сырое"):
             continue
-        if not await bot.send(hit.user_id, message(item, hit)):
+        if not await bot.send(hit.user_id, message(item, hit),
+                              keyboard=enrich.keyboard(item_id)):
             continue
         record(conn, item_id, hit.user_id, hit.topic_id, "сырое")
         if not sent and not item.get("sent_at"):

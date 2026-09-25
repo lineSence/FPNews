@@ -82,15 +82,28 @@ class Bot:
             return None
         return data
 
-    async def send(self, chat_id: int, text: str, preview: bool = True) -> bool:
+    async def send(self, chat_id: int, text: str, preview: bool = True,
+                   keyboard: dict[str, Any] | None = None) -> bool:
         """Одно сообщение. Разметка HTML, ссылка обязательна [NEWS-007]."""
-        data = await self.call(
-            "sendMessage",
-            chat_id=chat_id,
-            text=text[:MAX_TEXT],
-            parse_mode="HTML",
-            link_preview_options={"is_disabled": not preview},
-        )
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text[:MAX_TEXT],
+            "parse_mode": "HTML",
+            "link_preview_options": {"is_disabled": not preview},
+        }
+        if keyboard:
+            payload["reply_markup"] = keyboard
+        data = await self.call("sendMessage", **payload)
+        return data is not None
+
+    async def ack(self, callback_id: str, text: str = "") -> bool:
+        """Погасить «часики» на кнопке. Без этого телеграм крутит их минуту.
+
+        Ответ обязателен в течение нескольких секунд, а модель думает дольше,
+        поэтому гасим сразу, а результат присылаем отдельным сообщением.
+        """
+        data = await self.call("answerCallbackQuery", callback_query_id=callback_id,
+                               text=text[:200])
         return data is not None
 
     async def updates(self, timeout: int = 25) -> list[dict[str, Any]]:

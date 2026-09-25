@@ -14,10 +14,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from typing import Any
 
+from . import enrich, model
 from . import run as run_module
 from . import store, topics
 
@@ -30,7 +32,9 @@ HELP = (
     "<b>/удалить</b> номер — убрать тему\n"
     "<b>/задержка</b> — как быстро доходят новости\n\n"
     "Тема ловит слова в любой форме: «дрон» найдёт «дроны» и «дронов». "
-    "Фраза в кавычках ищется целиком."
+    "Фраза в кавычках ищется целиком.\n\n"
+    "Под каждой новостью три кнопки — выжимка, цитата, оценка. "
+    "Модель работает только по нажатию и только на текст этой новости."
 )
 
 
@@ -126,11 +130,46 @@ def answer(conn: sqlite3.Connection, user_id: int, name: str, text: str) -> str:
     return "Не понимаю. " + HELP
 
 
-async def serve(bot: Any, conn: sqlite3.Connection, stop: Any, rounds: int = 0) -> int:
+async def press(bot: Any, session: Any, conn: sqlite3.Connection, budget: Any,
+                query: dict[str, Any]) -> bool:
+    """Нажатие кнопки под новостью. Ответ приходит вторым сообщением.
+
+    «Часики» на кнопке гасятся сразу: телеграм ждёт ответа несколько секунд, а
+    модель думает дольше. Растянуть один на другого — значит показать человеку
+    ошибку там, где всё в порядке.
+    """
+    chat = (query.get("message") or {}).get("chat") or {}
+    parsed = enrich.parse(str(query.get("data") or ""))
+    if not chat.get("id") or parsed is None:
+        await bot.ack(str(query.get("id") or ""))
+        return False
+    kind, item_id = parsed
+    await bot.ack(str(query.get("id") or ""), "Спрашиваю модель…")
+    try:
+        text = await enrich.make(session, conn, item_id, kind, budget)
+    except Exception as exc:  # noqa: BLE001 — кнопка не роняет бота [CORE-017]
+        log.warning("кнопка «%s» для %s сорвалась: %s", kind, item_id, exc)
+        text = "Не получилось. Попробуйте ещё раз чуть позже."
+    await bot.send(int(chat["id"]), text, preview=False)
+    return True
+
+
+async def serve(bot: Any, conn: sqlite3.Connection, stop: Any, rounds: int = 0,
+                session: Any = None, budget: Any = None) -> int:
     """Длинный опрос обновлений. Отдельная задача, сторожам не мешает."""
     handled = 0
+    budget = budget if budget is not None else model.Budget()
+    pending: set[Any] = set()
     while not stop.is_set():
         for update in await bot.updates():
+            query = update.get("callback_query")
+            if query:
+                # Отдельной задачей: пока модель думает, бот отвечает другим.
+                task = asyncio.ensure_future(press(bot, session, conn, budget, query))
+                pending.add(task)
+                task.add_done_callback(pending.discard)
+                handled += 1
+                continue
             message = update.get("message") or update.get("edited_message") or {}
             chat = message.get("chat") or {}
             user = message.get("from") or {}
@@ -147,8 +186,10 @@ async def serve(bot: Any, conn: sqlite3.Connection, stop: Any, rounds: int = 0) 
         rounds -= 1
         if rounds == 0:
             break
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
     return handled
 
 
 __all__ = ("HELP", "add_topic", "answer", "drop_topic", "ensure_user", "latency_text",
-           "list_topics", "serve")
+           "list_topics", "press", "serve")

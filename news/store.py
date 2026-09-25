@@ -90,6 +90,16 @@ SCHEMA = (
         UNIQUE(item_id, user_id, kind)         -- защита от повторной отправки
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS enrichments (
+        item_id    INTEGER NOT NULL,
+        kind       TEXT NOT NULL,              -- выжимка | цитата | оценка
+        text       TEXT NOT NULL,
+        model      TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        UNIQUE(item_id, kind)                  -- второе нажатие бесплатно
+    )
+    """,
 )
 
 STAMPS = ("published_at", "listed_at", "fetched_at", "sent_at", "enriched_at")
@@ -258,5 +268,29 @@ def _delta(first: Any, second: Any) -> float | None:
     return round((end - start).total_seconds(), 3)
 
 
+def enrichment(conn: sqlite3.Connection, item_id: int, kind: str) -> dict[str, Any] | None:
+    """Готовый ответ модели по этой новости, если он уже есть.
+
+    Кэш здесь не оптимизация, а обязанность: десять человек нажимают ту же
+    кнопку под той же новостью, и десять одинаковых вызовов модели — это
+    выброшенная квота [CORE-016].
+    """
+    row = conn.execute(
+        "SELECT text, model, created_at FROM enrichments WHERE item_id = ? AND kind = ?",
+        (item_id, kind),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def save_enrichment(conn: sqlite3.Connection, item_id: int, kind: str, text: str,
+                    model: str) -> None:
+    conn.execute(
+        "INSERT INTO enrichments(item_id, kind, text, model, created_at) VALUES(?,?,?,?,?) "
+        "ON CONFLICT(item_id, kind) DO UPDATE SET text = excluded.text, "
+        "model = excluded.model, created_at = excluded.created_at",
+        (item_id, kind, text, model, now()),
+    )
+    conn.commit()
+
 __all__ = ("CACHE_KB", "DEFAULT_PATH", "SCHEMA", "STAMPS", "connect", "ensure", "fill",
-           "latency_of", "latency_rows", "mark_dup", "now", "published", "remember", "set_fingerprint", "stamp")
+           "enrichment", "latency_of", "latency_rows", "mark_dup", "now", "published", "remember", "save_enrichment", "set_fingerprint", "stamp")

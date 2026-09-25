@@ -15,7 +15,8 @@ class FakeBot:
         self.sent: list[tuple[int, str]] = []
         self.broken = broken
 
-    async def send(self, chat_id: int, text: str, preview: bool = True) -> bool:
+    async def send(self, chat_id: int, text: str, preview: bool = True,
+                   keyboard: dict | None = None) -> bool:
         if self.broken:
             return False
         self.sent.append((chat_id, text))

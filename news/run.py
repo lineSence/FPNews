@@ -20,7 +20,7 @@ from typing import Any
 
 import diag
 
-from . import article, dedup, deliver, fetch, sources, store, telegram
+from . import article, dedup, deliver, fetch, model, sources, store, telegram
 
 log = logging.getLogger("fpnews")
 
@@ -118,6 +118,7 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
             except NotImplementedError:  # pragma: no cover — Windows
                 pass
     done = asyncio.Event()
+    budget = model.Budget()
     async with fetch.client() as session:
         bot = telegram.Bot(session)
         if not bot.ready:
@@ -133,7 +134,10 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
             dispatch(bot, conn, queue, stop, done, session), name="рассылка"
         )
         talker = (
-            asyncio.create_task(bot_module.serve(bot, conn, stop), name="бот")
+            asyncio.create_task(
+                bot_module.serve(bot, conn, stop, session=session, budget=budget),
+                name="бот",
+            )
             if bot.ready
             else None
         )
@@ -148,6 +152,9 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
             talker.cancel()
     summary = report(conn)
     summary["разослано"] = sent
+    summary["вызовов_модели"] = budget.calls
+    if budget.cached:
+        summary["ответов_из_памяти"] = budget.cached
     summary["в_очереди_на_обработку"] = queue.qsize()
     conn.close()
     return summary
