@@ -214,6 +214,9 @@ LATE_COLUMNS = (
     ("users", "kinds", "TEXT NOT NULL DEFAULT ''"),
     # Из каких изданий человек согласен получать сообщения. Пусто — из всех.
     ("users", "sources", "TEXT NOT NULL DEFAULT ''"),
+    # Сводка: во сколько слать («09:00») и за какой день уже отправлена.
+    ("users", "digest_at", "TEXT NOT NULL DEFAULT ''"),
+    ("users", "digest_on", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -816,6 +819,70 @@ def bursts(conn: sqlite3.Connection, *, window: int = 2, background: int = 30,
     return out
 
 
+def set_digest(conn: sqlite3.Connection, user_id: int, when: str) -> None:
+    """Час сводки в виде «09:00». Пусто — сводка выключена."""
+    clean = str(when or "").strip()
+    if clean and ":" not in clean:
+        clean = ""
+    conn.execute("UPDATE users SET digest_at = ? WHERE id = ?", (clean, int(user_id)))
+    conn.commit()
+
+
+def mark_digest(conn: sqlite3.Connection, user_id: int, day: str) -> None:
+    """Отметить, что за этот день сводка ушла. Защита от повторной отправки."""
+    conn.execute("UPDATE users SET digest_on = ? WHERE id = ?", (str(day), int(user_id)))
+    conn.commit()
+
+
+def sizes(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Сколько чего в базе и сколько это весит. Для страницы состояния."""
+    страниц = conn.execute("PRAGMA page_count").fetchone()[0]
+    размер = conn.execute("PRAGMA page_size").fetchone()[0]
+    счёт = {}
+    for table in ("items", "item_revisions", "snapshots", "entities", "mentions",
+                  "vectors", "deliveries", "saved_queries"):
+        try:
+            счёт[table] = int(conn.execute(
+                "SELECT COUNT(*) AS n FROM {}".format(table)).fetchone()["n"])
+        except sqlite3.Error:
+            счёт[table] = 0
+    копии = conn.execute(
+        "SELECT COALESCE(SUM(LENGTH(packed)), 0) AS сжато, COALESCE(SUM(size), 0) AS исходно "
+        "FROM snapshots").fetchone()
+    return {
+        "база_кб": round(int(страниц) * int(размер) / 1024, 1),
+        "копии_кб": round(int(копии["сжато"] or 0) / 1024, 1),
+        "копии_исходно_кб": round(int(копии["исходно"] or 0) / 1024, 1),
+        "строк": счёт,
+    }
+
+
+def source_health(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Когда каждое издание давало материал в последний раз.
+
+    «Молчит» — это про наши наблюдения, а не про издание: возможно, оно
+    пишет, а мы не видим [NEWS-001]. Сравниваем с собственным обычным
+    промежутком между материалами за месяц, а не с выдуманной нормой.
+    """
+    rows = conn.execute(
+        "SELECT source, COUNT(*) AS всего, MAX(listed_at) AS последний, "
+        "(julianday('now') - julianday(MAX(listed_at))) * 24 AS часов_назад, "
+        "(julianday(MAX(listed_at)) - julianday(MIN(listed_at))) * 24 / "
+        "MAX(1, COUNT(*) - 1) AS обычно_часов FROM items "
+        "WHERE listed_at >= datetime('now', '-30 days') GROUP BY source ORDER BY source"
+    ).fetchall()
+    out = []
+    for row in rows:
+        часов = float(row["часов_назад"] or 0)
+        обычно = float(row["обычно_часов"] or 0)
+        out.append({
+            "код": row["source"], "всего": int(row["всего"]), "последний": row["последний"],
+            "часов_назад": round(часов, 1), "обычно_часов": round(обычно, 2),
+            "молчит": bool(обычно > 0 and часов > max(3 * обычно, 2.0)),
+        })
+    return out
+
+
 def mark_checked(conn: sqlite3.Connection, item_id: int) -> None:
     conn.execute(
         "UPDATE items SET checked_at = ?, checks = checks + 1 WHERE id = ?",
@@ -832,4 +899,4 @@ __all__ = ("CACHE_KB", "DEFAULT_PATH", "KINDS", "LATE_COLUMNS", "SCHEMA", "STAMP
            "source_enabled", "source_every", "source_states", "kinds_of", "stamp",
            "set_topic_delivery", "set_user_sources", "source_allowed", "topics_of",
            "toggle_notify", "user_sources", "vector_of", "bursts", "entities_top", "entity",
-           "entity_days", "entity_items")
+           "entity_days", "entity_items", "mark_digest", "set_digest", "sizes", "source_health")
