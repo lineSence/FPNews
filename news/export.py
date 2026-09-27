@@ -11,6 +11,12 @@ Excel, в блокнот следователя, в отдельную заме�
 
 Потолок строк тот же, что на странице: выгрузка не должна превращаться в
 способ выгрести базу одним запросом на одном ядре [CORE-025].
+
+Про формулы. Excel и LibreOffice считают ячейку, начинающуюся с «=», «+»,
+«-» или «@», формулой и выполняют её при открытии файла. Заголовки мы берём
+с чужих сайтов, то есть в ячейку попадает строка, которую писали не мы: это
+готовая инъекция формулы [CORE-016]. Поэтому такие значения уезжают с
+одиночной кавычкой впереди — таблица покажет текст, а не выполнит его.
 """
 
 from __future__ import annotations
@@ -23,6 +29,9 @@ from typing import Any
 from . import stream
 
 MAX_ROWS = 2000
+# Знаки, с которых таблица начинает считать ячейку формулой. Табуляция и
+# возврат каретки в списке потому, что ими можно сдвинуть начало строки.
+ФОРМУЛА = ("=", "+", "-", "@", "\t", "\r")
 COLUMNS = ("id", "заголовок", "источник", "опубликовано", "замечено", "url",
            "перепечатка_из", "правок", "снято")
 
@@ -44,13 +53,19 @@ def rows(conn: Any, query: dict[str, str], many: Any = None) -> list[dict[str, A
     return out[:MAX_ROWS]
 
 
+def safe_cell(value: Any) -> str:
+    """Значение ячейки, которое таблица не станет считать формулой."""
+    текст = "" if value is None else str(value)
+    return "'" + текст if текст[:1] in ФОРМУЛА else текст
+
+
 def as_csv(data: list[dict[str, Any]]) -> str:
     buffer = io.StringIO()
     writer = csv.DictWriter(buffer, fieldnames=COLUMNS, delimiter=";", extrasaction="ignore",
                             lineterminator="\r\n")
     writer.writeheader()
     for row in data:
-        writer.writerow({name: row.get(name, "") for name in COLUMNS})
+        writer.writerow({name: safe_cell(row.get(name, "")) for name in COLUMNS})
     # BOM — чтобы Excel не открыл кириллицу кракозябрами.
     return "\ufeff" + buffer.getvalue()
 
@@ -171,5 +186,5 @@ def _dossier_changes(conn: Any, номера: list[int], limit: int = 50) -> lis
     return строки
 
 
-__all__ = ("COLUMNS", "DOSSIER_ITEMS", "MAX_ROWS", "as_csv", "as_json", "dossier", "make",
-           "rows")
+__all__ = ("COLUMNS", "DOSSIER_ITEMS", "MAX_ROWS", "ФОРМУЛА", "as_csv", "as_json",
+           "dossier", "make", "rows", "safe_cell")
