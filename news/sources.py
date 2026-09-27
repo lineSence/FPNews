@@ -23,6 +23,15 @@ CONTENT = "{http://purl.org/rss/1.0/modules/content/}encoded"
 # Деловой Петербург кладёт полный текст в тег для Яндекса. Нам он тоже
 # годится: это тот же материал, и он снимает поход на страницу.
 YANDEX_FULL = "{http://news.yandex.ru}full-text"
+# Схемы, которые мы согласны считать ссылкой на материал. Всё остальное —
+# `javascript:`, `data:`, `mailto:` — не адрес новости, а способ выполнить
+# чужой код в браузере читателя или в клиенте Telegram [CORE-016]. Проверка
+# стоит здесь, а не на странице: адрес из ленты уезжает и в базу, и в бот, и
+# чинить его в каждой точке вывода поздно.
+СХЕМЫ = ("http://", "https://")
+# Схема в начале строки: «javascript:», «data:», «tel:». Нужна, чтобы
+# отличить чужую схему от обычной относительной ссылки «2026/09/24/1/».
+SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:")
 ANCHOR = re.compile(r"<a\b[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>", re.S | re.I)
 TAG = re.compile(r"<[^>]+>|<!--.*?-->", re.S)
 SPACE = re.compile(r"\s+")
@@ -169,13 +178,22 @@ def canonical(url: str, host: str = "") -> str:
     Без этого один материал из ленты, из письма и со страницы суток выглядит
     как три разных: `?from=main`, `?utm_source=`, `#comments`.
     """
-    raw = (url or "").strip()
+    raw = "".join(знак for знак in (url or "").strip()
+                  if ord(знак) >= 32 and ord(знак) != 127)
     if not raw:
         return ""
     if raw.startswith("//"):
         raw = "https:" + raw
     elif raw.startswith("/"):
         raw = host.rstrip("/") + raw
+    elif host and not SCHEME.match(raw):
+        # Относительная ссылка без ведущей косой: у Фонтанки в разметке
+        # встречается и такая.
+        raw = host.rstrip("/") + "/" + raw
+    if not raw.lower().startswith(СХЕМЫ):
+        # Пусто, а не исключение: разбор ленты не должен падать от одной
+        # странной ссылки, а сторож пропустит такую строку [CORE-017].
+        return ""
     raw = raw.split("#", 1)[0]
     head, _, query = raw.partition("?")
     if query:
@@ -260,6 +278,8 @@ __all__ = (
     "PAPER",
     "RIA",
     "YANDEX_FULL",
+    "СХЕМЫ",
+    "SCHEME",
     "Found",
     "MEDUZA",
     "Source",
