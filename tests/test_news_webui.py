@@ -10,6 +10,7 @@ from __future__ import annotations
 import urllib.parse
 from pathlib import Path
 
+from news import access
 from news import bot as bot_module
 from news import deliver, pages, store, web
 
@@ -17,6 +18,10 @@ from news import deliver, pages, store, web
 def _db(tmp_path: Path):
     conn = store.connect(tmp_path / "db.sqlite3")
     bot_module.ensure_user(conn, 7, "Владелец")
+    # Человек здесь не случайно называется владельцем: источники, хранение и
+    # доступы меняют общую настройку, и читателю они закрыты [CORE-016].
+    # Что именно видит и может читатель — в `test_news_security.py`.
+    access.назначить(conn, 7, access.ВЛАДЕЛЕЦ)
     return conn
 
 
