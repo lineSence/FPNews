@@ -151,6 +151,7 @@ MENU = (
         ("/источники", "Источники"),
     )),
     ("Служебное", (
+        ("/доступы", "Доступы"),
         ("/состояние", "Состояние"),
         ("/хранение", "Хранение и архив"),
         ("/диагностика", "Диагностика"),
@@ -340,7 +341,7 @@ def toggle(action: str, mark: str, fields: dict[str, Any], on: bool, title: str)
              вкл=" вкл" if on else "", title=html.escape(title))
 
 
-def _status_line(conn: Any, mark: str) -> str:
+def _status_line(conn: Any, mark: str, owner: bool = True) -> str:
     """Строка состояния: идёт ли опрос, когда был последний заход, две кнопки.
 
     Состояние живёт в памяти процесса (`news.bridge`), а не в базе: просьба
@@ -369,6 +370,8 @@ def _status_line(conn: Any, mark: str) -> str:
     ответ = (" · проверка связи: {} ({} назад)".format(
         html.escape(str(проверка.get("ответ", ""))),
         lag(time.time() - float(проверка["когда"]))) if проверка.get("когда") else "")
+    # Читателю кнопок не показываем вовсе: форма, которая всё равно ответит
+    # отказом, — хуже, чем её отсутствие [CORE-019].
     кнопки = (
         '<form class=строка method=post action="/опросить" style="display:inline">'
         '<input type=hidden name=метка value="{mark}">'
@@ -376,7 +379,7 @@ def _status_line(conn: Any, mark: str) -> str:
         '<form class=строка method=post action="/проверка" style="display:inline">'
         '<input type=hidden name=метка value="{mark}">'
         "<button class=тихо>Тест в бот</button></form>"
-    ).format(mark=mark)
+    ).format(mark=mark) if owner else '<span class=тихо>только владелец</span>'
     return (
         '<div class="панель состояние"><div>{слева}'
         '<div class=тихо>{подпись} · память {память}{ответ}</div></div>'
@@ -555,7 +558,8 @@ def _queries_panel(conn: Any, user_id: int, mark: str) -> str:
         список, форма)
 
 
-def home(conn: Any, user_id: int, mark: str, theme: str = "система") -> str:
+def home(conn: Any, user_id: int, mark: str, theme: str = "система",
+         owner: bool = True) -> str:
     """Главная — сводка за сутки: что изменилось, кого стали упоминать, что уходит.
 
     Первым экраном идут наблюдения, а не настройки: человек приходит узнать,
@@ -574,7 +578,7 @@ def home(conn: Any, user_id: int, mark: str, theme: str = "система") -> s
              '<input type=hidden name=метка value="{}">'
              "<button class=тихо>Выйти</button></form>").format(mark)
     return page("Что происходило за сутки",
-                _summary_bar(conn) + _status_line(conn, mark) +
+                _summary_bar(conn) + _status_line(conn, mark, owner) +
                 '<div class=две><div>{}</div><div>{}{}</div></div>'.format(
                     левая, правая, выход),
                 theme, "/")
@@ -1046,7 +1050,8 @@ def changes_page(conn: Any, theme: str = "система", limit: int = 50) -> s
     return page("Правки и снятия", "".join(строки), theme, "/правки")
 
 
-def sources_page(conn: Any, mark: str, theme: str = "система") -> str:
+def sources_page(conn: Any, mark: str, theme: str = "система",
+                 owner: bool = True) -> str:
     """Источники: что опрашиваем, как часто, что выключено."""
     from . import sources as sources_module  # noqa: PLC0415
 
@@ -1060,19 +1065,23 @@ def sources_page(conn: Any, mark: str, theme: str = "система") -> str:
             "SELECT COUNT(*) AS всего, MAX(listed_at) AS последний FROM items WHERE source = ?",
             (code,),
         ).fetchone()
-        rows.append(
-            "<tr><td>{name}</td><td>{count}</td><td>{last}</td>"
-            "<td><form class=строка method=post action=\"/источники/интервал\">"
+        настройка = (
+            "<form class=строка method=post action=\"/источники/интервал\">"
             '<input type=hidden name=метка value="{mark}">'
             '<input type=hidden name=код value="{code}">'
             '<input type=number name=секунд value="{every}" min=0 step=30 size=5>'
-            "<button class=тихо>Сохранить</button></form></td>"
-            "<td>{тумблер}</td></tr>".format(
+            "<button class=тихо>Сохранить</button></form>"
+        ).format(mark=mark, code=html.escape(code),
+                 every=every or int(source.interval)) if owner else "{} с".format(
+                     every or int(source.interval))
+        rows.append(
+            "<tr><td>{name}</td><td>{count}</td><td>{last}</td>"
+            "<td>{настройка}</td><td>{тумблер}</td></tr>".format(
                 name=label(code), count=int(last["всего"] or 0),
-                last=when(last["последний"]), mark=mark, code=html.escape(code),
-                every=every or int(source.interval),
+                last=when(last["последний"]), настройка=настройка,
                 тумблер=toggle("/источники/переключить", mark, {"код": code}, enabled,
-                               "опрашиваем" if enabled else "не опрашиваем"),
+                               "опрашиваем" if enabled else "не опрашиваем")
+                if owner else ("опрашиваем" if enabled else "не опрашиваем"),
             )
         )
     table = (
@@ -1410,7 +1419,8 @@ def state_page(conn: Any, theme: str = "система") -> str:
                 .format(объёмы, счёт), theme, "/состояние")
 
 
-def storage_page(conn: Any, mark: str, theme: str = "система") -> str:
+def storage_page(conn: Any, mark: str, theme: str = "система",
+                 owner: bool = True) -> str:
     """Хранение и архив: сколько занято, за какой срок и что можно выбросить."""
     размеры = store.sizes(conn)
     архив = store.archive_span(conn)
@@ -1436,7 +1446,8 @@ def storage_page(conn: Any, mark: str, theme: str = "система") -> str:
         '<form class=строка method=post action="/хранение/сжать">'
         '<input type=hidden name=метка value="{mark}">'
         "<button class=тихо>Сжать файл базы</button></form>"
-    ).format(mark=mark)
+    ).format(mark=mark) if owner else (
+        "<p class=тихо>Чистку и сжатие делает владелец.</p>")
     return page(
         "Хранение и архив",
         "<div class=панель>Архив с {первый} по {последний} · {всего} материалов · "
@@ -1452,6 +1463,69 @@ def storage_page(conn: Any, mark: str, theme: str = "система") -> str:
             всего=архив["всего"], копий=архив["копий"],
             первая=when(архив["первая_копия"]), объёмы=объёмы, счёт=счёт, чистка=чистка),
         theme, "/хранение")
+
+
+def access_page(conn: Any, mark: str, theme: str = "система") -> str:
+    """Доступы: кому выдан ключ, что с ним стало, кого пора отозвать.
+
+    Ключей здесь нет и быть не может: в базе лежит только отпечаток. Строка
+    «состояние» — наблюдение, а не приговор: «ждёт», «использовано»,
+    «отозвано» [NEWS-008]. Страница обещана ботом в ответе на
+    «/пригласить», и до сих пор её в вебе просто не было.
+    """
+    from . import access  # noqa: PLC0415 — нужен только здесь
+
+    строки = []
+    for запись in access.приглашения(conn):
+        отзыв = (
+            '<form class=строка method=post action="/доступы/отозвать">'
+            '<input type=hidden name=метка value="{mark}">'
+            '<input type=hidden name=номер value="{номер}">'
+            "<button class=тихо>Отозвать</button></form>"
+        ).format(mark=mark, номер=запись["номер"]) if запись["состояние"] != "отозвано" else ""
+        строки.append(
+            "<tr><td>{номер}</td><td>{кому}</td><td>{роль}</td><td>{выдан}</td>"
+            "<td>{годен}</td><td>{вошёл}</td><td>{состояние}</td><td>{отзыв}</td></tr>".format(
+                номер=запись["номер"], кому=html.escape(запись["кому"]) or "—",
+                роль=html.escape(запись["роль"]), выдан=when(запись["выдан"]),
+                годен=when(запись["годен_до"]),
+                вошёл=html.escape(запись["имя"]) or (запись["кем"] or "—"),
+                состояние=html.escape(запись["состояние"]), отзыв=отзыв))
+    таблица = (
+        "<table><tr><th>№</th><th>кому</th><th>роль</th><th>выдан</th>"
+        "<th>годен до</th><th>вошёл</th><th>состояние</th><th></th></tr>{}</table>"
+    ).format("".join(строки)) if строки else (
+        "<p class=тихо>Приглашений пока нет.</p>")
+    форма = (
+        '<form class=строка method=post action="/доступы/выдать">'
+        '<input type=hidden name=метка value="{mark}">'
+        '<input type=text name=кому placeholder="кому — для памяти" maxlength=200>'
+        '<select name=роль><option value="читатель">читатель</option>'
+        '<option value="владелец">владелец</option></select>'
+        "<button>Выдать ключ</button></form>"
+    ).format(mark=mark)
+    return page(
+        "Доступы", таблица + "<h2>Новое приглашение</h2>" + форма +
+        "<p class=тихо>Ключ видно один раз — сразу после выдачи. В базе лежит только "
+        "его отпечаток, восстановить ключ нельзя. Приглашение живёт {} дней и гасится "
+        "при первом использовании. Отзыв закрывает и сессии того, кто им вошёл "
+        "[CORE-016].</p>".format(access.DEFAULT_DAYS),
+        theme, "/доступы")
+
+
+def invite_page(номер: Any, ключ: str, theme: str = "система") -> str:
+    """Единственное место, где виден сам ключ. Второй раз его не показать."""
+    показанный = html.escape(str(ключ))
+    return page(
+        "Приглашение выдано",
+        '<div class=панель>Приглашение №{номер}: передайте ключ лично — он заменяет '
+        "собой вход.</div><p><code>{ключ}</code></p>"
+        "<p>Человек отправляет боту <code>/ключ {ключ}</code>.</p>"
+        '<p class=тихо>Обновление этой страницы выдаст ещё одно приглашение, поэтому '
+        'уходите отсюда ссылкой, а не клавишей F5.</p>'
+        '<p><a href="/доступы">К списку доступов</a></p>'.format(
+            номер=html.escape(str(номер)), ключ=показанный),
+        theme, "/доступы")
 
 
 def diagnostics_page(theme: str = "система") -> str:
@@ -1589,7 +1663,8 @@ def link_message(url: str) -> str:
             "<code>ssh -N -L 6769:127.0.0.1:6769 пользователь@сервер</code>").format(url)
 
 
-__all__ = ("MENU", "PER_PAGE", "STYLE", "THEMES", "bursts_page", "changes_page", "copy_page",
+__all__ = ("MENU", "PER_PAGE", "STYLE", "THEMES", "access_page", "invite_page",
+           "bursts_page", "changes_page", "copy_page",
            "digest_page", "state_page",
            "entities_page", "entity_page", "feed", "stream_page",
            "home", "item_page", "label", "lag", "latency", "link_message", "login", "oops",
