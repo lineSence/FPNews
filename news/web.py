@@ -9,16 +9,10 @@ JavaScript. `aiohttp` или `starlette` с `uvicorn` — это 30–60 МБ п
 Здесь `asyncio.start_server`, разбор запроса руками и ответ строкой. Это
 примерно двести строк, которые полностью понятны и ничего не тянут.
 
-Про безопасность. Сервер слушает `127.0.0.1` и наружу не смотрит: снаружи
-будет Caddy с сертификатом, а он же добавит HTTPS и ограничение частоты. До
-этого момента интерфейс доступен только на самой машине или через
-`ssh -N -L 6769:127.0.0.1:6769`.
-
-Вход — одноразовый код из бота, а не Telegram Login Widget. Причина простая:
-виджету нужен публичный домен, привязанный к боту, а проверять интерфейс надо
-на `localhost` до всякого домена. Код живёт пять минут, сгорает при первом
-использовании и не даёт ничего, кроме сессии того же человека, который его
-запросил.
+Про безопасность. Сервер слушает `127.0.0.1`: снаружи будет Caddy с
+сертификатом. Вход — одноразовый код из бота на пять минут, он сгорает при
+первом использовании. Решения «кому что можно», защитные заголовки и уборка
+просроченных сессий живут в `news/guard.py` — здесь только маршруты.
 """
 
 from __future__ import annotations
@@ -31,7 +25,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import bridge, pages, store
+from . import bridge, guard, pages, store
 
 log = logging.getLogger("fpnews.web")
 
@@ -111,14 +105,15 @@ class Response:
             "HTTP/1.1 {}".format(self.status),
             "Content-Type: {}".format(self.kind),
             "Content-Length: {}".format(len(data)),
-            "X-Content-Type-Options: nosniff",
-            "Referrer-Policy: same-origin",
             "Connection: close",
         ]
+        head += guard.заголовки()
+        # Значения, собранные из запроса, проходят через `guard.чисто`:
+        # перевод строки внутри `Location` разрезал бы ответ [CORE-016].
         if self.location:
-            head.append("Location: {}".format(self.location))
+            head.append("Location: {}".format(guard.чисто(self.location)))
         if self.cookie:
-            head.append("Set-Cookie: {}".format(self.cookie))
+            head.append("Set-Cookie: {}".format(guard.чисто(self.cookie)))
         if self.filename:
             # Имя в кавычках и в UTF-8: без этого браузер сохранит «лента»
             # набором вопросительных знаков.
@@ -209,7 +204,7 @@ def redeem(conn: Any, code: str) -> int:
 
 
 def cookie_value(token: str) -> str:
-    secure = "; Secure" if (os.getenv("FPNEWS_WEB_SECURE") or "") == "1" else ""
+    secure = "; Secure" if guard.за_проксёй() else ""
     return "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}".format(
         COOKIE, token, SESSION_DAYS * 86400, secure
     )
@@ -235,7 +230,7 @@ def safe_back(where: str) -> str:
     чужим адресом, и открытый редирект из настройки оформления — подарок для
     поддельной страницы входа [CORE-016].
     """
-    where = where or "/"
+    where = guard.чисто(where) or "/"
     if not where.startswith("/") or where.startswith("//") or "\\" in where:
         return "/"
     return where
@@ -250,7 +245,8 @@ def csrf(token: str) -> str:
 
 # Разделы, куда возвращаемся после формы: список закрыт, чтобы адрес из
 # формы не превратился в редирект куда попало.
-_SECTIONS = ("/запросы", "/источники", "/сводка", "/телеграм", "/темы", "/хранение")
+_SECTIONS = ("/доступы", "/запросы", "/источники", "/сводка", "/телеграм", "/темы",
+             "/хранение")
 
 
 def _number(raw: Any) -> int:
@@ -263,18 +259,39 @@ def _number(raw: Any) -> int:
 
 def route(conn: Any, request: Request) -> Response:
     """Вся маршрутизация. Чистая функция — поэтому и проверяется тестами."""
+    from . import access  # noqa: PLC0415 — нужен только здесь
     from . import bot as bot_module  # noqa: PLC0415 — импорт здесь разрывает круг
 
     token = request.cookies.get(COOKIE) or ""
     user_id = whoami(conn, request)
     theme = theme_of(request)
     if request.path == "/вход":
+        # Код гасим всегда, даже когда попыток уже слишком много: иначе
+        # чужой перебор закрывал бы вход и настоящему человеку [CORE-017].
         entering = redeem(conn, request.query.get("код", ""))
-        if not entering:
-            return Response(pages.login(theme), status="401 Unauthorized")
-        return redirect("/", cookie_value(new_session(conn, entering)))
+        if entering:
+            guard.забыть_входы()
+            guard.убрать_просроченное(conn)
+            return redirect("/", cookie_value(new_session(conn, entering)))
+        сколько = guard.неудачный_вход()
+        if сколько >= guard.ПОПЫТОК_ВХОДА:
+            log.warning("неудачных входов в окне: %s", сколько)
+            return Response(pages.oops(
+                "Слишком много попыток входа. Попросите у бота свежий код "
+                "и попробуйте через несколько минут.", theme),
+                status="429 Too Many Requests")
+        return Response(pages.login(theme), status="401 Unauthorized")
     if not user_id:
         return Response(pages.login(theme), status="401 Unauthorized")
+    if guard.отозван(conn, user_id):
+        # Приглашение отозвали, а кука в браузере осталась. Гасим сессию,
+        # а не просто отказываем: иначе она проживёт свои тридцать дней.
+        conn.execute("DELETE FROM sessions WHERE user_id = ?", (int(user_id),))
+        conn.commit()
+        return Response(pages.login(theme), status="401 Unauthorized")
+    хозяин = access.владелец(conn, user_id)
+    if not guard.пускать(conn, user_id, request.path, request.method):
+        return Response(pages.oops(guard.ОТКАЗ, theme), status="403 Forbidden")
     if request.method == "POST":
         if request.form.get("метка") != csrf(token):
             # Причина почти всегда одна: страницу открыли до входа или сессия
@@ -331,6 +348,15 @@ def route(conn: Any, request: Request) -> Response:
             store.set_digest(conn, user_id, request.form.get("время", ""))
         elif request.path == "/телеграм/издания":
             store.set_user_sources(conn, user_id, request.all_of("издание"))
+        elif request.path == "/доступы/выдать":
+            ключ, номер = access.выдать(
+                conn, request.form.get("кому", ""),
+                роль=(request.form.get("роль", "") or access.ЧИТАТЕЛЬ))
+            # Единственный ответ формы, который не перенаправление: ключ
+            # существует только в этом ответе, в базе лежит лишь отпечаток.
+            return Response(pages.invite_page(номер, ключ, theme))
+        elif request.path == "/доступы/отозвать":
+            access.отозвать(conn, request.form.get("номер", ""))
         elif request.path == "/телеграм/тема":
             store.set_topic_delivery(conn, _number(request.form.get("номер")), user_id,
                                      enabled=bool(request.form.get("отдавать")),
@@ -343,7 +369,9 @@ def route(conn: Any, request: Request) -> Response:
         chosen = want if want in pages.THEMES else "система"
         return redirect(safe_back(request.query.get("откуда", "/")), theme_cookie(chosen))
     if request.path == "/":
-        return Response(pages.home(conn, user_id, csrf(token), theme))
+        return Response(pages.home(conn, user_id, csrf(token), theme, хозяин))
+    if request.path == "/доступы":
+        return Response(pages.access_page(conn, csrf(token), theme))
     if request.path == "/темы":
         return Response(pages.topics_page(conn, user_id, csrf(token), theme))
     if request.path == "/задержки":
@@ -362,7 +390,7 @@ def route(conn: Any, request: Request) -> Response:
         тело, тип, имя = export.make(conn, request.query, вид, request.all_asked)
         return Response(тело, kind=тип, filename=имя)
     if request.path == "/хранение":
-        return Response(pages.storage_page(conn, csrf(token), theme))
+        return Response(pages.storage_page(conn, csrf(token), theme, хозяин))
     if request.path == "/диагностика":
         return Response(pages.diagnostics_page(theme))
     if request.path == "/замеры":
@@ -391,7 +419,7 @@ def route(conn: Any, request: Request) -> Response:
     if request.path == "/правки":
         return Response(pages.changes_page(conn, theme))
     if request.path == "/источники":
-        return Response(pages.sources_page(conn, csrf(token), theme))
+        return Response(pages.sources_page(conn, csrf(token), theme, хозяин))
     if request.path == "/телеграм":
         return Response(pages.telegram_page(conn, user_id, csrf(token), theme))
     if request.path == "/запросы":
