@@ -87,6 +87,21 @@ def empty(data: dict[str, Any]) -> bool:
     return not (data["ваше"] or data["правки"] or data["снятия"] or data["всплески"])
 
 
+def _норма_словами(row: dict[str, Any]) -> str:
+    """Хвост строки всплеска. Множитель — только когда есть на что делить.
+
+    При нулевой медиане фона (о ком-то пишут реже чем через день) «во
+    сколько раз» не определено: store отдаёт None, и печатать его как «×None»
+    нельзя. Пишем словами, что обычно — ноль [NEWS-001].
+    """
+    if row.get("новое"):
+        return " (впервые)"
+    раз = row.get("во_сколько_раз")
+    if раз:
+        return " (×{} к норме)".format(раз)
+    return " (обычно — ноль в день)"
+
+
 def text(data: dict[str, Any], base_url: str = "") -> str:
     """Сводка словами. HTML для Telegram, ссылки на оригиналы обязательны."""
     куски = ["<b>Сводка за {} ч</b>".format(int(data["часов"])),
@@ -113,7 +128,7 @@ def text(data: dict[str, Any], base_url: str = "") -> str:
         куски.extend(
             "• {name} — {сейчас} за сутки{хвост}".format(
                 name=html.escape(str(row["имя"])), сейчас=row["сейчас"],
-                хвост=" (впервые)" if row["новое"] else " (×{})".format(row["во_сколько_раз"]))
+                хвост=_норма_словами(row))
             for row in data["всплески"]
         )
     if base_url:

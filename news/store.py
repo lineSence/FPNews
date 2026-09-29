@@ -1232,14 +1232,20 @@ def bursts(conn: sqlite3.Connection, *, window: int = 1, background: int = 28,
     хвост, параметры = scope.условие(conn, user_id)
     чужие = (" AND " + хвост) if хвост else ""
     строки = conn.execute(
+        # Окно режется по времени, а не по календарной дате: иначе вчерашний
+        # день, задетый окном хоть одной заметкой, целиком уходил в «сейчас»
+        # (до двух суток вместо одних) и выпадал из фона.
         "SELECT e.id, e.kind, e.name, "
         "date(COALESCE(i.published_at, i.listed_at)) AS день, "
-        "COUNT(*) AS сколько, COUNT(DISTINCT i.source) AS изданий, "
-        "MAX(CASE WHEN julianday(COALESCE(i.published_at, i.listed_at)) "
-        ">= julianday('now', ?) THEN 1 ELSE 0 END) AS свежий "
+        "SUM(CASE WHEN julianday(COALESCE(i.published_at, i.listed_at)) "
+        ">= julianday('now', ?1) THEN 1 ELSE 0 END) AS свежих, "
+        "SUM(CASE WHEN julianday(COALESCE(i.published_at, i.listed_at)) "
+        "< julianday('now', ?1) THEN 1 ELSE 0 END) AS фоновых, "
+        "GROUP_CONCAT(DISTINCT CASE WHEN julianday(COALESCE(i.published_at, "
+        "i.listed_at)) >= julianday('now', ?1) THEN i.source END) AS издания "
         "FROM entities e JOIN mentions m ON m.entity_id = e.id "
         "JOIN items i ON i.id = m.item_id "
-        "WHERE julianday(COALESCE(i.published_at, i.listed_at)) >= julianday('now', ?)"
+        "WHERE julianday(COALESCE(i.published_at, i.listed_at)) >= julianday('now', ?2)"
         + чужие + " "
         "GROUP BY e.id, день",
         ("-{} days".format(окно), "-{} days".format(фон_дней), *параметры),
@@ -1248,13 +1254,12 @@ def bursts(conn: sqlite3.Connection, *, window: int = 1, background: int = 28,
     for строка in строки:
         запись = собрано.setdefault(int(строка["id"]), {
             "вид": строка["kind"], "имя": строка["name"],
-            "дни": [], "сейчас": 0, "изданий": 0,
+            "дни": [], "сейчас": 0, "издания": set(),
         })
-        if строка["свежий"]:
-            запись["сейчас"] += int(строка["сколько"])
-            запись["изданий"] = max(запись["изданий"], int(строка["изданий"]))
-        else:
-            запись["дни"].append(int(строка["сколько"]))
+        запись["сейчас"] += int(строка["свежих"] or 0)
+        запись["издания"].update(filter(None, str(строка["издания"] or "").split(",")))
+        if строка["фоновых"]:
+            запись["дни"].append(int(строка["фоновых"]))
     итог = []
     for номер, запись in собрано.items():
         сейчас = int(запись["сейчас"])
@@ -1272,7 +1277,7 @@ def bursts(conn: sqlite3.Connection, *, window: int = 1, background: int = 28,
             continue
         итог.append({
             "id": номер, "вид": запись["вид"], "имя": запись["имя"],
-            "сейчас": сейчас, "изданий": int(запись["изданий"]),
+            "сейчас": сейчас, "изданий": len(запись["издания"]),
             "норма": round(float(норма), 1), "разброс": round(float(разброс), 1),
             "отклонение": round(float(отклонение), 1),
             "во_сколько_раз": round(сейчас / норма, 1) if норма > 0 else None,
