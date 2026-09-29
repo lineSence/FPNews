@@ -137,6 +137,10 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
         bot = telegram.Bot(session)
         if not bot.ready:
             log.warning("TELEGRAM_BOT_TOKEN не задан: новости будут копиться в базе без рассылки")
+        else:
+            # Короткий список команд в системном меню телеграма: всё остальное
+            # делается кнопками из /меню.
+            await bot.set_commands()
         # Встроенные источники описаны в коде, добавленные — в базе: и те и
         # другие равноправны, и сторожа не должны их различать [NEWS-005].
         известные = sources.registry(conn)

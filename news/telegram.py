@@ -39,6 +39,29 @@ TOKEN_RE = re.compile(r"bot\d{6,}:[A-Za-z0-9_-]{20,}")
 # Телеграм режет сообщения на 4096 символах; оставляем запас на разметку.
 MAX_TEXT = 3900
 
+# Команды, которые бот показывает в системном меню телеграма. Полный список
+# команд в несколько раз длиннее — но обычному человеку достаточно трёх:
+# всё остальное делается кнопками из /меню.
+КОМАНДЫ = (
+    ("меню", "Управление кнопками"),
+    ("помощь", "Что я умею"),
+    ("сводка", "Что я пропустил"),
+    ("вход", "Ссылка в веб-интерфейс"),
+)
+
+
+def inline(rows: list[list[tuple[str, str]]]) -> dict[str, Any]:
+    """Клавиатура под сообщением. Ряд — список кнопок (надпись, данные).
+
+    Данные нажатия телеграм ограничивает шестьюдесятью четырьмя байтами,
+    поэтому меню держит их короткими. Кнопки несут экран и всё нужное для
+    действия в самих себе: старые сообщения не ломаются после перезапуска.
+    """
+    return {"inline_keyboard": [
+        [{"text": text, "callback_data": data} for text, data in row]
+        for row in rows
+    ]}
+
 
 def token() -> str:
     return (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
@@ -97,6 +120,41 @@ class Bot:
         data = await self.call("sendMessage", **payload)
         return data is not None
 
+    async def edit(self, chat_id: int, message_id: int, text: str,
+                   preview: bool = False,
+                   keyboard: dict[str, Any] | None = None) -> bool:
+        """Перерисовать сообщение меню на месте.
+
+        Меню живёт в одном сообщении: экраны сменяют друг друга здесь, а
+        не новыми сообщениями, чтобы чат не превращался в простыню. Если
+        телеграм отказал — например, текст не изменился или сообщение
+        слишком старое, — вызывающий пошлёт новое.
+        """
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text[:MAX_TEXT],
+            "parse_mode": "HTML",
+            "link_preview_options": {"is_disabled": not preview},
+        }
+        if keyboard:
+            payload["reply_markup"] = keyboard
+        data = await self.call("editMessageText", **payload)
+        return data is not None
+
+    async def set_commands(self) -> bool:
+        """Показать короткий список команд в системном меню телеграма.
+
+        Отказ для нас не страшен: длинные русские команды работают и без
+        этого — setMyCommands лишь прячет лишнее из меню.
+        """
+        data = await self.call(
+            "setMyCommands",
+            commands=[{"command": name, "description": описание}
+                      for name, описание in КОМАНДЫ],
+        )
+        return data is not None
+
     async def ack(self, callback_id: str, text: str = "") -> bool:
         """Погасить «часики» на кнопке. Без этого телеграм крутит их минуту.
 
@@ -118,4 +176,4 @@ class Bot:
         return result
 
 
-__all__ = ("API", "Bot", "MAX_TEXT", "hush", "safe", "token")
+__all__ = ("API", "Bot", "КОМАНДЫ", "MAX_TEXT", "hush", "inline", "safe", "token")
