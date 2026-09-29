@@ -433,7 +433,7 @@ async def press(bot: Any, session: Any, conn: sqlite3.Connection, budget: Any,
 async def serve(bot: Any, conn: sqlite3.Connection, stop: Any, rounds: int = 0,
                 session: Any = None, budget: Any = None) -> int:
     """Длинный опрос обновлений. Отдельная задача, сторожам не мешает."""
-    from . import menu  # noqa: PLC0415 — импорт здесь разрывает круг
+    from . import menu, telegram  # noqa: PLC0415 — импорт здесь разрывает круг
 
     handled = 0
     budget = budget if budget is not None else model.Budget()
@@ -465,7 +465,9 @@ async def serve(bot: Any, conn: sqlite3.Connection, stop: Any, rounds: int = 0,
                     str(message.get("text") or ""),
                 ), None
             else:
-                reply, keyboard = экран
+                # Меню отдаёт ряды (надпись, данные); телеграму нужен объект
+                # reply_markup — голый список он отвергает, и /меню молчит.
+                reply, keyboard = экран[0], telegram.inline(экран[1] or [])
             await bot.send(int(chat["id"]), reply, preview=False, keyboard=keyboard)
             handled += 1
         rounds -= 1

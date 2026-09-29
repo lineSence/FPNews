@@ -11,12 +11,15 @@ import asyncio
 from pathlib import Path
 
 from news import bot as bot_module
-from news import bridge, pages, store, web
+from news import access, bridge, pages, store, web
 
 
 def _db(tmp_path: Path):
     conn = store.connect(tmp_path / "db.sqlite3")
     bot_module.ensure_user(conn, 7, "Владелец")
+    # Опрос и проверка связи — действия владельца [guard]: без роли веб
+    # честно отвечает 403, и тесты моста проверяли бы охрану, а не мост.
+    access.назначить(conn, 7, "владелец")
     return conn
 
 

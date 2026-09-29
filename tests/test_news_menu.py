@@ -12,9 +12,21 @@ import asyncio
 import time
 from pathlib import Path
 
+import pytest
+
 from news import access, bridge, menu, store
 from news import bot as bot_module
 from news import telegram
+
+
+@pytest.fixture(autouse=True)
+def _чистый_процесс():
+    """Меню и мост держат состояние в памяти процесса (диалоги, очередь
+    проверок связи). Без уборки оно протекает в чужие тесты: «проверка связи»
+    из меню оставляла 7 в bridge.ТЕСТЫ, и test_news_security падал."""
+    yield
+    menu._диалоги.clear()
+    bridge.забыть()
 
 
 class FakeBot:
@@ -131,7 +143,7 @@ def test_новая_тема_диалогом(tmp_path: Path) -> None:
 def test_слова_и_стоп_слова_диалогом(tmp_path: Path) -> None:
     conn = _база(tmp_path)
     bot = FakeBot()
-    номер = bot_module.add_topic(conn, 7, "движ")  # noqa: F841
+    bot_module.add_topic(conn, 7, "движ")
     тема = store.topics_of(conn, 7)[0]["id"]
     _жмём(conn, bot, 7, "m:tslova:{}".format(тема))
     menu.сообщение(conn, 7, "марш")
@@ -366,3 +378,57 @@ def test_клавиатура_собирается_из_рядов() -> None:
          {"text": "Вторая", "callback_data": "m:2"}],
         [{"text": "Третья", "callback_data": "m:3"}],
     ]}
+
+
+# --- Путь через serve: то, что реально уходит в телеграм ---
+
+class _Стоп:
+    def is_set(self) -> bool:
+        return False
+
+
+class _Опрос(FakeBot):
+    """Бот с одной порцией обновлений — как длинный опрос телеграма."""
+
+    def __init__(self, updates: list[dict]) -> None:
+        super().__init__()
+        self._updates = updates
+
+    async def updates(self) -> list[dict]:
+        порция, self._updates = self._updates, []
+        return порция
+
+
+def test_меню_через_serve_шлёт_объект_клавиатуры(tmp_path: Path) -> None:
+    """Регрессия шага 19: serve отдавал в reply_markup голый список рядов,
+    телеграм отвергал sendMessage, и /меню молчало."""
+    conn = _база(tmp_path)
+    bot = _Опрос([{"message": {"chat": {"id": 7}, "from": {"first_name": "В"},
+                               "text": "/меню"}}])
+    assert asyncio.run(bot_module.serve(bot, conn, _Стоп(), rounds=1)) == 1
+    _, текст, клавиатура = bot.sent[-1]
+    assert "Главное меню" in текст
+    assert isinstance(клавиатура, dict)
+    ряды = клавиатура["inline_keyboard"]
+    assert ряды and all(isinstance(кнопка, dict) and кнопка["callback_data"]
+                        for ряд in ряды for кнопка in ряд)
+
+
+def test_обычная_команда_через_serve_без_клавиатуры(tmp_path: Path) -> None:
+    conn = _база(tmp_path)
+    bot = _Опрос([{"message": {"chat": {"id": 7}, "from": {"first_name": "В"},
+                               "text": "/темы"}}])
+    asyncio.run(bot_module.serve(bot, conn, _Стоп(), rounds=1))
+    assert bot.sent[-1][2] is None
+
+
+def test_системное_меню_принимается_телеграмом(tmp_path: Path) -> None:
+    """setMyCommands отвергает весь список из-за одной нелатинской команды."""
+    conn = _база(tmp_path)
+    for команда, описание in telegram.КОМАНДЫ:
+        assert telegram.КОМАНДА_RE.match(команда), команда
+        assert 1 <= len(описание) <= 256
+        # Каждую команду из системного меню бот понимает.
+        ответ = menu.сообщение(conn, 7, "/" + команда) or (
+            bot_module.answer(conn, 7, "В", "/" + команда), None)
+        assert not ответ[0].startswith("Не понимаю"), команда
