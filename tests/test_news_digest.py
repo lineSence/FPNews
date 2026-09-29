@@ -45,6 +45,9 @@ def test_сводка_собирает_своё_и_общее(tmp_path: Path) ->
     conn = _conn(tmp_path)
     первый = _add(conn, "Мост закрыли")
     второй = _add(conn, "Тариф вырос", "dp")
+    # Сводка личная: правки и снятия видны только из своих изданий, поэтому
+    # «dp» человек выбрал сам, а «Мост закрыли» ему пришло.
+    store.follow_feed(conn, 7, "dp")
     conn.execute("INSERT INTO deliveries(item_id, user_id, kind, sent_at) VALUES(?,?,?,?)",
                  (первый, 7, "сырое", store.now()))
     conn.commit()
@@ -73,6 +76,8 @@ def test_сводка_уходит_один_раз_в_день(tmp_path: Path) -
     conn = _conn(tmp_path)
     store.set_digest(conn, 7, "09:00")
     item = _add(conn, "Мост закрыли")
+    # Снятие чужого издания в личную сводку не попадает: выбираем fontanka.
+    store.follow_feed(conn, 7, "fontanka")
     store.mark_gone(conn, item, 410)
     бот = _Бот()
     assert asyncio.run(digest.once(бот, conn)) == 1

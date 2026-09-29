@@ -41,7 +41,7 @@ def test_страница_подписок_и_кнопки(tmp_path: Path) -> No
     token = web.new_session(conn, 8)
     ответ = _get(conn, "/подписки", token)
     assert ответ.status.startswith("200")
-    assert "Подписки на издания" in ответ.body and "meduza" in ответ.body
+    assert "Мои издания" in ответ.body and "meduza" in ответ.body
     тело = _mark(token) + "&код=meduza"
     assert _post(conn, "/подписки/добавить", token, тело).status.startswith("303")
     assert {строка["code"] for строка in store.feed_subs_of(conn, 8)} == {"meduza"}

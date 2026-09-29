@@ -19,7 +19,7 @@ import html
 import urllib.parse
 from typing import Any
 
-from . import store
+from . import scope, store
 
 # Оформление: одна таблица переменных и её тёмное переопределение. Тема
 # приходит из куки, поэтому переключатель работает без единой строчки
@@ -134,7 +134,7 @@ code, .ровно { font-family:ui-monospace, Menlo, Consolas, monospace; font-s
 MENU = (
     ("Наблюдение", (
         ("/", "Сводка"),
-        ("/лента", "Общая лента"),
+        ("/лента", "Мой поток"),
         ("/поиск", "Поиск по архиву"),
         ("/правки", "Правки и снятия"),
         ("/всплески", "Всплески"),
@@ -145,7 +145,7 @@ MENU = (
         ("/сводка", "Ежедневная сводка"),
         ("/телеграм", "Отдача в Telegram"),
         ("/запросы", "Сохранённые запросы"),
-        ("/подписки", "Подписки на издания"),
+        ("/подписки", "Мои издания"),
     )),
     ("Настройка", (
         ("/темы", "Мои темы"),
@@ -390,12 +390,18 @@ def _status_line(conn: Any, mark: str, owner: bool = True) -> str:
              ответ=ответ, кнопки=кнопки)
 
 
-def _change_cards(conn: Any, limit: int = 50) -> list[str]:
-    """Карточки правок и снятий — общие для главной и для страницы правок."""
+def _change_cards(conn: Any, limit: int = 50, *, user_id: int = 0) -> list[str]:
+    """Карточки правок и снятий — общие для главной и для страницы правок.
+
+    Правка чужого материала — тоже чужая информация: карточки проходят через
+    личную область видимости того, кто смотрит страницу.
+    """
     from . import diff as diff_module  # noqa: PLC0415
 
+    хвост, параметры = scope.условие(conn, user_id)
+    чужие = (" WHERE " + хвост) if хвост else ""
     карточки = []
-    for row in store.gone(conn, limit):
+    for row in store.gone(conn, limit, user_id=user_id):
         копии = store.snapshots(conn, int(row["id"]))
         отпечаток = str(копии[-1]["sha256"])[:16] if копии else ""
         опубликовано = row["published_at"] or row["listed_at"]
@@ -415,9 +421,9 @@ def _change_cards(conn: Any, limit: int = 50) -> list[str]:
         )
     правки = conn.execute(
         "SELECT r.item_id, r.seen_at, r.title, r.text, i.source, i.title AS now_title, "
-        "i.body AS now_body FROM item_revisions r JOIN items i ON i.id = r.item_id "
-        "ORDER BY r.id DESC LIMIT ?",
-        (int(limit),),
+        "i.body AS now_body FROM item_revisions r JOIN items i ON i.id = r.item_id"
+        + чужие + " ORDER BY r.id DESC LIMIT ?",
+        (*параметры, int(limit)),
     ).fetchall()
     видели: set[int] = set()
     for rev in правки:
@@ -462,15 +468,15 @@ def _removed_quote(old: str, new: str, limit: int = 160) -> str:
     return "убрали: «{}» · {}".format(самый, сводка)
 
 
-def _burst_block(conn: Any, limit: int = 5) -> str:
+def _burst_block(conn: Any, limit: int = 5, *, user_id: int = 0) -> str:
     """Всплески со спарклайном: кого стали упоминать чаще обычного [NEWS-008]."""
-    строки = store.bursts(conn)[:limit]
+    строки = store.bursts(conn, user_id=user_id)[:limit]
     if not строки:
         return ("<h2>Всплески</h2><p class=тихо>Никто не выбился из своего обычного "
                 "фона. Это наблюдение, а не тишина в городе [NEWS-001].</p>")
     куски = []
     for row in строки:
-        дни = store.entity_days(conn, int(row["id"]), 14)
+        дни = store.entity_days(conn, int(row["id"]), 14, user_id=user_id)
         по_дням = {str(день["день"]): int(день["сколько"]) for день in дни}
         потолок = max(по_дням.values() or [1])
         подряд = sorted(по_дням.items())[-14:]
@@ -567,12 +573,12 @@ def home(conn: Any, user_id: int, mark: str, theme: str = "система",
     что происходило, и только потом что-то крутит. Цифры в полосе — про наш
     архив и нашу задержку, а не про город [NEWS-008].
     """
-    карточки = _change_cards(conn, 6)[:6]
+    карточки = _change_cards(conn, 6, user_id=user_id)[:6]
     левая = "<h2>Правки и исчезновения</h2>" + ("".join(карточки) if карточки else
         "<p class=тихо>Ни правок, ни снятий мы пока не видели. Это не значит, "
         "что их не было [NEWS-001].</p>")
     левая += '<p class=тихо><a href="/правки">Весь журнал правок</a></p>'
-    левая += _burst_block(conn)
+    левая += _burst_block(conn, user_id=user_id)
     правая = (_sources_panel(conn) + _telegram_panel(conn, user_id) +
               _queries_panel(conn, user_id, mark))
     выход = ('<form method=post action="/выход">'
@@ -878,16 +884,23 @@ def _stream_row(row: dict[str, Any]) -> str:
 
 def stream_page(conn: Any, user_id: int, query: dict[str, str], theme: str = "система",
                 many: Any = None) -> str:
-    """Общая лента: что вообще вышло, с отбором и раскладкой по папкам.
+    """Мой поток: что вышло в выбранных изданиях, с отбором и папками.
 
-    Это не «пришло вам»: здесь весь собранный выход, включая то, что не
-    попало ни в одну тему. Пустая лента означает, что мы ничего не видели за
-    этот период, а не что изданий не было [NEWS-001].
+    Это не «весь собранный выход»: лента проходит через личную область
+    видимости — свои издания и то, что приходило. Чужих выборов здесь нет
+    [CORE-016]. Пустая лента означает, что в выбранном мы ничего не видели
+    за этот период, а не что изданий не было [NEWS-001].
     """
     from . import stream  # noqa: PLC0415
 
+    if scope.пустая(conn, user_id):
+        return page("Мой поток",
+                    "<p class=тихо>Вы пока ничего не выбрали: подпишитесь хотя бы на "
+                    'одно издание — и здесь появится ваш поток, только ваш.</p>'
+                    '<p><a href="/подписки">Выбрать издания</a> · '
+                    '<a href="/темы">Или завести тему</a></p>', theme, "/лента")
     flt = stream.read(query, many)
-    rows = stream.select(conn, flt)
+    rows = stream.select(conn, flt, user_id)
     ещё = len(rows) > stream.PER_PAGE
     rows = rows[:stream.PER_PAGE]
     куски = [_stream_form(conn, user_id, flt)]
@@ -916,10 +929,11 @@ def stream_page(conn: Any, user_id: int, query: dict[str, str], theme: str = "с
         шаги.append('<a href="{}">дальше</a>'.format(stream.link(flt, стр=flt.page + 1)))
     if шаги:
         куски.append("<p>{}</p>".format(" · ".join(шаги)))
-    return page("Общая лента", "".join(куски), theme, "/лента")
+    return page("Мой поток", "".join(куски), theme, "/лента")
 
 
-def search_page(conn: Any, query: dict[str, str], theme: str = "система") -> str:
+def search_page(conn: Any, query: dict[str, str], theme: str = "система",
+                user_id: int = 0) -> str:
     """Выдача поиска с формой и постраничностью.
 
     Без непустого запроса выборки нет вовсе: «показать всё» на одном ядре
@@ -949,6 +963,7 @@ def search_page(conn: Any, query: dict[str, str], theme: str = "система")
         only_revised=str(query.get("правки") or "") == "1",
         limit=PER_PAGE + 1,
         offset=(number - 1) * PER_PAGE,
+        user_id=user_id,
     )
     more = len(rows) > PER_PAGE
     rows = rows[:PER_PAGE]
@@ -966,17 +981,21 @@ def search_page(conn: Any, query: dict[str, str], theme: str = "система")
     return page("Поиск", form + listing + paging, theme, "/поиск")
 
 
-def item_page(conn: Any, raw_id: Any, theme: str = "система") -> str | None:
+def item_page(conn: Any, raw_id: Any, theme: str = "система",
+              user_id: int = 0) -> str | None:
     """Карточка материала. `None` — такого материала нет.
 
     Тело чужой статьи здесь не показывается: только лид и ссылка
-    на источник [NEWS-007].
+    на источник [NEWS-007]. Номер в адресной строке не открывает чужое:
+    материал обязан быть в личной области видимости [CORE-016].
     """
     from . import search as search_module  # noqa: PLC0415
 
     try:
         item_id = int(str(raw_id))
     except (TypeError, ValueError):
+        return None
+    if not scope.видит(conn, user_id, item_id):
         return None
     card = search_module.item(conn, item_id)
     if card is None:
@@ -1095,9 +1114,10 @@ def _copies_block(card: dict[str, Any]) -> str:
     ).format(rows)
 
 
-def changes_page(conn: Any, theme: str = "система", limit: int = 50) -> str:
+def changes_page(conn: Any, theme: str = "система", limit: int = 50, *,
+                 user_id: int = 0) -> str:
     """Журнал правок и снятий: что изменилось в городе за последние дни."""
-    строки = _change_cards(conn, limit)
+    строки = _change_cards(conn, limit, user_id=user_id)
     if not строки:
         строки = ["<p class=тихо>Ни правок, ни снятий мы пока не видели. "
                   "Это не значит, что их не было [NEWS-001].</p>"]
@@ -1145,10 +1165,11 @@ def sources_page(conn: Any, mark: str, theme: str = "система",
             подписка = toggle("/подписки/{}".format("убрать" if on else "добавить"),
                               mark, {"код": code}, on,
                               "целиком" if on else "не целиком")
-        rows.append(
+        люди = len(store.feed_subscribers(conn, code)) if owner else 0
+        строка = (
             "<tr><td>{name}</td><td>{count}</td><td>{last}</td>"
             "<td>{настройка}</td><td>{тумблер} {убрать}</td>"
-            "<td>{подписка}</td></tr>".format(
+            "<td>{подписка}</td>".format(
                 name=label(code, conn), count=int(last["всего"] or 0),
                 last=when(last["последний"]), настройка=настройка,
                 тумблер=toggle("/источники/переключить", mark, {"код": code}, enabled,
@@ -1158,56 +1179,73 @@ def sources_page(conn: Any, mark: str, theme: str = "система",
                 подписка=подписка or ("<span class=тихо>—</span>"),
             )
         )
-    table = (
-        "<table><tr><th>издание</th><th>материалов</th><th>последний</th>"
-        "<th>интервал, с</th><th></th><th>в бот целиком</th></tr>{}</table>"
-    ).format("".join(rows))
-    панель = ""
-    if owner:
-        результаты = "".join(
-            '<p class=тихо>{}</p>'.format(html.escape(строка))
-            for строка in discover.сводка())
-        панель = (
-            '<div class=панель><h3>Добавить издание</h3>'
-            '<form class=строка method=post action="/источники/добавить">'
-            '<input type=hidden name=метка value="{mark}">'
-            '<input type=text name=сайт size=28 placeholder="example.com">'
-            "<button>Найти ленту</button></form>"
-            "<p class=тихо>Лента ищется по правилам: сначала объявленная в разметке "
-            "главной страницы, затем стандартные пути — /feed/, /rss/. Найденную "
-            "программа проверит, замерит и подключит; результат придёт сообщением "
-            "в бот. Адрес ленты можно указать и целиком.</p>"
-            "{результаты}</div>"
-        ).format(mark=mark, результаты=результаты)
+        if owner:
+            строка += "<td>{} чел.</td>".format(люди)
+        rows.append(строка + "</tr>")
+    шапка = ("<tr><th>издание</th><th>материалов</th><th>последний</th>"
+             "<th>интервал, с</th><th>состояние</th><th>в бот целиком</th>{люди}</tr>")
+    table = "<table>" + шапка.format(
+        люди="<th>подписчиков</th>" if owner else "") + "".join(rows) + "</table>"
+    # Добавить издание может каждый: каталог общий, а выбор из него — личный.
+    # Так человек не зависит от того, догадался ли кто-то другой подключить
+    # нужное ему издание [CORE-016].
+    результаты = "".join(
+        '<p class=тихо>{}</p>'.format(html.escape(строка))
+        for строка in discover.сводка())
+    панель = (
+        '<div class=панель><h3>Добавить издание</h3>'
+        '<form class=строка method=post action="/источники/добавить">'
+        '<input type=hidden name=метка value="{mark}">'
+        '<input type=text name=сайт size=28 placeholder="example.com">'
+        "<button>Найти ленту</button></form>"
+        "<p class=тихо>Лента ищется по правилам: сначала объявленная в разметке "
+        "главной страницы, затем стандартные пути — /feed/, /rss/. Найденную "
+        "программа проверит, замерит и подключит; результат придёт сообщением "
+        "в бот. Адрес ленты можно указать и целиком. Добавленное издание "
+        "появляется в общем каталоге, но никто его не получает, пока не "
+        "выберет сам.</p>"
+        "{результаты}</div>"
+    ).format(mark=mark, результаты=результаты)
+    подписчики_абзац = (
+        "<p class=тихо>Колонка «подписчиков» показывает, скольким людям издание "
+        "уже нужно — перед выключением страница спросит подтверждение.</p>"
+        if owner else "")
     return page("Источники", table + панель +
                 "<p class=тихо>Выключенное издание не опрашивается вовсе — это настройка "
-                "сбора, а не фильтр выдачи. Интервал 0 означает «как задано в коде». "
+                "сбора, а не фильтр выдачи, и менять её может только владелец. "
+                "Интервал 0 означает «как задано в коде». "
                 "«Убрать» возвращается только к добавленным лентам: встроенные издания "
                 "выключаются тумблером, а их записи в архиве остаются в обоих случаях.</p>"
+                + подписчики_абзац +
                 "<p class=тихо>Колонка «в бот целиком» — подписка на издание: каждый "
                 "новый материал уходит в бот без темы. Что появилось раньше подписки, "
-                "не приходит — только новое.</p>",
+                "не приходит — только новое. Три состояния издания и подписку «на всё» "
+                'настраивайте на странице <a href="/подписки">Мои издания</a>.</p>',
                 theme, "/источники")
 
 
 def subs_page(conn: Any, user_id: int, mark: str, theme: str = "система") -> str:
-    """Подписки на издания целиком: всё новое из выбранного уходит в бот."""
+    """Мои издания: три состояния на каждое и подписка «на всё».
+
+    Экран собирает два существующих механизма в одну картину: подписку
+    целиком (`feed_subs`), фильтр отдачи (`users.sources`) и умолчание
+    «через темы». Раньше подписка была на одной странице, фильтр — на
+    «Телеграме», и понять, что именно придёт из издания, было нельзя.
+    """
     from . import sources as sources_module  # noqa: PLC0415
 
     mine = {row["code"] for row in store.feed_subs_of(conn, user_id)}
     rows = []
     for code, source in sorted(sources_module.registry(conn).items()):
-        on = code in mine
+        режим = store.source_mode(conn, user_id, code)
         rows.append(
-            "<tr><td>{label}</td><td><code>{code}</code></td><td>{кнопка}</td></tr>".format(
+            "<tr><td>{label}</td><td><code>{code}</code></td><td>{кнопки}</td></tr>".format(
                 label=label(code, conn), code=html.escape(code),
-                кнопка=toggle("/подписки/{}".format("убрать" if on else "добавить"),
-                              mark, {"код": code}, on,
-                              "подписан" if on else "не подписан"),
+                кнопки=_режимы(mark, code, режим),
             )
         )
     table = (
-        "<table><tr><th>издание</th><th>код для бота</th><th></th></tr>{}</table>"
+        "<table><tr><th>издание</th><th>код для бота</th><th>отдача</th></tr>{}</table>"
     ).format("".join(rows))
     всё = "подписан на всё" if "" in mine else "не подписан на всё"
     панель = (
@@ -1217,15 +1255,63 @@ def subs_page(conn: Any, user_id: int, mark: str, theme: str = "система")
         '<input type=hidden name=код value="">'
         "<button>{всё}</button></form>"
         "<p class=тихо>Подписка «всё» приносит каждый новый материал из каждого "
-        "опрашиваемого издания.</p></div>"
+        "опрашиваемого издания — включая издания, которые подключат позже.</p></div>"
     ).format(action="убрать" if "" in mine else "добавить", mark=mark, всё=всё)
-    return page("Подписки на издания",
-                "<h2>Издания целиком в Telegram</h2>" + панель + table +
+    return page("Мои издания",
+                панель + table +
+                "<p class=тихо>Три состояния на каждое издание: «всё» — каждый новый "
+                "материал уходит в бот; «темы» — по умолчанию, приходит только то, "
+                "что сработало по вашим темам и сторожам; «тишина» — не приходит "
+                "ничего, даже по темам.</p>"
                 "<p class=тихо>Подписка не проигрывает историю: уходит только то, "
                 "что появилось в базе после подписки. Тема и подписка на одно издание "
                 "не дублируются: материал уходит один раз — темой, если она сработала, "
-                "иначе подпиской.</p>",
+                "иначе подпиской. После «тишины» новое издание в каталоге молчит, "
+                "пока вы его сами не выберете.</p>",
                 theme, "/подписки")
+
+
+def _режимы(mark: str, code: str, текущий: str) -> str:
+    """Три кнопки состояния издания. Текущее — отмеченный текст, не кнопка."""
+    порядок = ("всё", "темы", "тишина")
+    out = []
+    for название in порядок:
+        if название == текущий:
+            out.append('<b>{}</b>'.format(название))
+        else:
+            out.append((
+                '<form class=строка method=post action="/подписки/режим" '
+                'style="display:inline">'
+                '<input type=hidden name=метка value="{mark}">'
+                '<input type=hidden name=код value="{code}">'
+                '<input type=hidden name=режим value="{режим}">'
+                "<button class=тихо>{режим}</button></form>"
+            ).format(mark=mark, code=html.escape(code), режим=название))
+    return " ".join(out)
+
+
+def confirm_page(текст: str, action: str, mark: str, fields: dict[str, Any],
+                 кнопка: str, theme: str = "система") -> str:
+    """Страница-подтверждение для действия, у которого есть другие люди.
+
+    Выключение издания с подписчиками — не то же самое, что выключение
+    пустого: у первого есть цена для тех, кто его выбрал. Один экран
+    честно называет цену, и только вторая форма делает дело.
+    """
+    скрытые = "".join(
+        '<input type=hidden name="{}" value="{}">'.format(
+            html.escape(str(имя)), html.escape(str(значение)))
+        for имя, значение in fields.items())
+    return page(
+        "Подтвердите",
+        "<p>{}</p>".format(html.escape(текст)) +
+        '<form method=post action="{}">'.format(html.escape(action)) +
+        '<input type=hidden name=метка value="{}">'.format(html.escape(mark)) +
+        скрытые +
+        '<input type=hidden name=точно value="1">' +
+        "<button>{}</button> ".format(html.escape(кнопка)) +
+        '<a href="/источники">отменить</a></form>',
+        theme, "/источники")
 
 
 def telegram_page(conn: Any, user_id: int, mark: str, theme: str = "система") -> str:
@@ -1372,7 +1458,8 @@ def queries_page(conn: Any, user_id: int, mark: str, theme: str = "систем�
                 theme, "/запросы")
 
 
-def entities_page(conn: Any, query: dict[str, str], theme: str = "система") -> str:
+def entities_page(conn: Any, query: dict[str, str], theme: str = "система",
+                  user_id: int = 0) -> str:
     """Кто и что упоминается: люди, организации, места, суммы."""
     from . import entities as entities_module  # noqa: PLC0415
 
@@ -1383,7 +1470,7 @@ def entities_page(conn: Any, query: dict[str, str], theme: str = "система
         дней = max(1, min(365, int(str(query.get("дней", "30") or "30"))))
     except ValueError:
         дней = 30
-    строки = store.entities_top(conn, kind=вид, query=слово, days=дней)
+    строки = store.entities_top(conn, kind=вид, query=слово, days=дней, user_id=user_id)
     кнопки = " ".join(
         '<a href="/сущности?вид={code}&дней={дней}"{here}>{name}</a>'.format(
             code=urllib.parse.quote(name), дней=дней,
@@ -1421,8 +1508,14 @@ def entities_page(conn: Any, query: dict[str, str], theme: str = "система
                 theme, "/сущности")
 
 
-def entity_page(conn: Any, raw_id: Any, theme: str = "система") -> str | None:
-    """Карточка сущности: где встречалась и когда о ней писали."""
+def entity_page(conn: Any, raw_id: Any, theme: str = "система",
+                user_id: int = 0) -> str | None:
+    """Карточка сущности: где встречалась и когда о ней писали.
+
+    Сущность — общее имя, но материалы в ней проходят через личную область
+    видимости: у одного человека «Смольный» из «Фонтанки», у другого из
+    «Медузы», и смешивать их списки нельзя [CORE-016].
+    """
     try:
         entity_id = int(str(raw_id))
     except (TypeError, ValueError):
@@ -1430,8 +1523,8 @@ def entity_page(conn: Any, raw_id: Any, theme: str = "система") -> str | 
     карточка = store.entity(conn, entity_id)
     if карточка is None:
         return None
-    материалы = store.entity_items(conn, entity_id)
-    дни = store.entity_days(conn, entity_id, 30)
+    материалы = store.entity_items(conn, entity_id, user_id=user_id)
+    дни = store.entity_days(conn, entity_id, 30, user_id=user_id)
     предел = max([int(day["сколько"]) for day in дни] or [1])
     полоска = "".join(
         '<span class=день title="{день}: {сколько}" style="height:{высота}px"></span>'.format(
@@ -1464,9 +1557,9 @@ def entity_page(conn: Any, raw_id: Any, theme: str = "система") -> str | 
     return page(str(карточка["name"]), тело, theme, "/сущности")
 
 
-def bursts_page(conn: Any, theme: str = "система") -> str:
+def bursts_page(conn: Any, theme: str = "система", user_id: int = 0) -> str:
     """Всплески: о ком вдруг стали писать чаще своей же нормы."""
-    строки = store.bursts(conn)
+    строки = store.bursts(conn, user_id=user_id)
     if not строки:
         тело = ("<p class=тихо>Всплесков не видно: никто не выбился из своей обычной "
                 "нормы. Это наблюдение о письме, а не о тишине в городе [NEWS-001].</p>")
@@ -1743,22 +1836,35 @@ def measures_page(conn: Any, theme: str = "система") -> str:
         theme, "/замеры")
 
 
-def copy_page(conn: Any, raw_id: Any) -> str | None:
-    """Сохранённая копия страницы как есть. `None` — такой копии нет."""
+def copy_page(conn: Any, raw_id: Any, user_id: int = 0) -> str | None:
+    """Сохранённая копия страницы как есть. `None` — такой копии нет.
+
+    Копия — чужой HTML, и её номер не должен открывать чужой материал:
+    сначала проверяем, чей это предмет, и только потом распаковываем
+    [CORE-016].
+    """
     try:
         snapshot_id = int(str(raw_id))
     except (TypeError, ValueError):
         return None
+    if user_id:
+        row = conn.execute(
+            "SELECT item_id FROM snapshots WHERE id = ?", (snapshot_id,)).fetchone()
+        if row is None or not scope.видит(conn, user_id, int(row["item_id"])):
+            return None
     return store.snapshot_page(conn, snapshot_id) or None
 
 
-def story_page(conn: Any, raw_id: Any, theme: str = "система") -> str | None:
+def story_page(conn: Any, raw_id: Any, theme: str = "система",
+               user_id: int = 0) -> str | None:
     """Сюжет: кто первым и насколько отстали остальные."""
     from . import search as search_module  # noqa: PLC0415
 
     try:
         item_id = int(str(raw_id))
     except (TypeError, ValueError):
+        return None
+    if not scope.видит(conn, user_id, item_id):
         return None
     plot = search_module.story(conn, item_id)
     if plot is None:

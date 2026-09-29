@@ -19,6 +19,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from . import scope
+
 DEFAULT_PATH = Path("data/fpnews.sqlite3")
 # Кэш страниц SQLite в килобайтах со знаком минус. 20 МБ — осознанный потолок:
 # на сервере свободно около 500 МБ, и база не имеет права их съесть.
@@ -600,12 +602,22 @@ def revive(conn: sqlite3.Connection, item_id: int) -> None:
     conn.commit()
 
 
-def gone(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, Any]]:
-    """Снятые с публикации, самые свежие первыми."""
+def gone(conn: sqlite3.Connection, limit: int = 50, *,
+         user_id: int = 0) -> list[dict[str, Any]]:
+    """Снятые с публикации, самые свежие первыми.
+
+    Чужих снятий читатель не видит: карточка снятия — это чужой материал,
+    если издание не выбрано человеком и ему не приходило [CORE-016].
+    """
+    хвост, параметры = scope.условие(conn, user_id)
+    where = "i.gone_at IS NOT NULL"
+    if хвост:
+        where = "{} AND {}".format(where, хвост)
     rows = conn.execute(
-        "SELECT id, url, source, title, published_at, listed_at, gone_at, gone_code "
-        "FROM items WHERE gone_at IS NOT NULL ORDER BY gone_at DESC LIMIT ?",
-        (int(limit),),
+        "SELECT i.id, i.url, i.source, i.title, i.published_at, i.listed_at, "
+        "i.gone_at, i.gone_code "
+        "FROM items i WHERE {} ORDER BY i.gone_at DESC LIMIT ?".format(where),
+        (*параметры, int(limit)),
     ).fetchall()
     return [dict(row) for row in rows]
 
@@ -969,6 +981,64 @@ def feed_subscribers(conn: sqlite3.Connection, source: Any) -> list[dict[str, An
     return [dict(row) for row in rows]
 
 
+# --- «Мои издания»: три состояния на каждое издание ---
+
+РЕЖИМЫ = ("всё", "тишина", "темы")
+
+
+def source_mode(conn: sqlite3.Connection, user_id: int, code: Any) -> str:
+    """Состояние издания для человека: «всё», «тишина» или «темы».
+
+    Три состояния — это два существующих механизма, увиденные вместе:
+    «всё» — подписка целиком (`feed_subs`), «тишина» — фильтр отдачи
+    (`users.sources`), «темы» — умолчание: материал приходит, только если
+    сработает тема или сторож. Состояние «тишина» видно лишь тогда, когда
+    фильтр непустой: пустой список в `users.sources` означает «можно всё».
+    """
+    код = str(code or "").strip().lower()
+    if any(row["code"] == код for row in feed_subs_of(conn, user_id)):
+        return "всё"
+    chosen = user_sources(conn, user_id)
+    if chosen and код not in chosen:
+        return "тишина"
+    return "темы"
+
+
+def set_source_mode(conn: sqlite3.Connection, user_id: int, code: Any,
+                    режим: Any, все: Any) -> bool:
+    """Установить состояние издания для человека. False — издания нет.
+
+    Полный список изданий приходит довеском, а не берётся из реестра: `store`
+    не должен знать о модуле источников, а «тишина» без полного списка не
+    вычислить — ей надо вычесть одно издание из всех. Новый источник в
+    каталоге при непустом фильтре молчит до ручного выбора: так человек
+    видит ровно то, что выбрал, и ничего сверх [CORE-016].
+    """
+    код = str(code or "").strip().lower()
+    полный = {str(c or "").strip().lower() for c in (все or []) if str(c or "").strip()}
+    if not код or код not in полный:
+        return False
+    какой = str(режим or "").strip().lower()
+    if какой not in РЕЖИМЫ:
+        return False
+    chosen = user_sources(conn, user_id)
+    if какой == "всё":
+        follow_feed(conn, user_id, код)
+        if chosen and код not in chosen:
+            set_user_sources(conn, user_id, chosen | {код})
+    elif какой == "тишина":
+        unfollow_feed(conn, user_id, код)
+        if chosen:
+            set_user_sources(conn, user_id, chosen - {код})
+        else:
+            set_user_sources(conn, user_id, полный - {код})
+    else:
+        unfollow_feed(conn, user_id, код)
+        if chosen and код not in chosen:
+            set_user_sources(conn, user_id, chosen | {код})
+    return True
+
+
 # --- Профили тем: слова, стоп-слова, порог ---
 
 def _topic_of(conn: sqlite3.Connection, topic_id: int, user_id: int) -> sqlite3.Row | None:
@@ -1065,10 +1135,15 @@ def feedback_texts(conn: sqlite3.Connection, topic_id: int, verdict: int = 1,
 
 
 def entities_top(conn: sqlite3.Connection, *, kind: str = "", query: str = "",
-                 days: int = 30, limit: int = 100) -> list[dict[str, Any]]:
+                 days: int = 30, limit: int = 100,
+                 user_id: int = 0) -> list[dict[str, Any]]:
     """Кого чаще всего упоминают за окно. Пустой список — мы не видели."""
     where = ["m.item_id = i.id"]
     params: list[Any] = []
+    хвост, параметры = scope.условие(conn, user_id)
+    if хвост:
+        where.append(хвост)
+        params.extend(параметры)
     if kind:
         where.append("e.kind = ?")
         params.append(kind)
@@ -1096,31 +1171,38 @@ def entity(conn: sqlite3.Connection, entity_id: int) -> dict[str, Any] | None:
 
 
 def entity_items(conn: sqlite3.Connection, entity_id: int,
-                 limit: int = 50) -> list[dict[str, Any]]:
+                 limit: int = 50, *, user_id: int = 0) -> list[dict[str, Any]]:
     """Материалы, где сущность встретилась. Свежие сверху, со ссылкой."""
+    хвост, параметры = scope.условие(conn, user_id)
+    чужие = (" AND " + хвост) if хвост else ""
     rows = conn.execute(
         "SELECT i.id, i.title, i.url, i.source, i.published_at, i.listed_at, i.gone_at, "
         "m.in_title, m.times FROM mentions m JOIN items i ON i.id = m.item_id "
-        "WHERE m.entity_id = ? ORDER BY COALESCE(i.published_at, i.listed_at) DESC LIMIT ?",
-        (int(entity_id), max(1, min(int(limit), 200))),
+        "WHERE m.entity_id = ?" + чужие +
+        " ORDER BY COALESCE(i.published_at, i.listed_at) DESC LIMIT ?",
+        (int(entity_id), *параметры, max(1, min(int(limit), 200))),
     ).fetchall()
     return [dict(row) for row in rows]
 
 
-def entity_days(conn: sqlite3.Connection, entity_id: int, days: int = 30) -> list[dict[str, Any]]:
+def entity_days(conn: sqlite3.Connection, entity_id: int, days: int = 30, *,
+                user_id: int = 0) -> list[dict[str, Any]]:
     """Упоминания по дням — для полоски всплеска на карточке."""
+    хвост, параметры = scope.условие(conn, user_id)
+    чужие = (" AND " + хвост) if хвост else ""
     rows = conn.execute(
         "SELECT date(COALESCE(i.published_at, i.listed_at)) AS день, COUNT(*) AS сколько "
         "FROM mentions m JOIN items i ON i.id = m.item_id WHERE m.entity_id = ? "
-        "AND julianday(COALESCE(i.published_at, i.listed_at)) >= julianday('now', ?) "
+        "AND julianday(COALESCE(i.published_at, i.listed_at)) >= julianday('now', ?)"
+        + чужие + " "
         "GROUP BY день ORDER BY день",
-        (int(entity_id), "-{} days".format(int(days))),
+        (int(entity_id), "-{} days".format(int(days)), *параметры),
     ).fetchall()
     return [dict(row) for row in rows]
 
 
 def bursts(conn: sqlite3.Connection, *, window: int = 1, background: int = 28,
-           limit: int = 30, порог: float = 3.0) -> list[dict[str, Any]]:
+           limit: int = 30, порог: float = 3.0, user_id: int = 0) -> list[dict[str, Any]]:
     """Всплески: о ком стали писать заметно чаще своей же нормы.
 
     Норма считается медианой дневных упоминаний за четыре недели, а разброс —
@@ -1147,6 +1229,8 @@ def bursts(conn: sqlite3.Connection, *, window: int = 1, background: int = 28,
 
     окно = max(1, int(window))
     фон_дней = max(окно + 1, int(background))
+    хвост, параметры = scope.условие(conn, user_id)
+    чужие = (" AND " + хвост) if хвост else ""
     строки = conn.execute(
         "SELECT e.id, e.kind, e.name, "
         "date(COALESCE(i.published_at, i.listed_at)) AS день, "
@@ -1155,9 +1239,10 @@ def bursts(conn: sqlite3.Connection, *, window: int = 1, background: int = 28,
         ">= julianday('now', ?) THEN 1 ELSE 0 END) AS свежий "
         "FROM entities e JOIN mentions m ON m.entity_id = e.id "
         "JOIN items i ON i.id = m.item_id "
-        "WHERE julianday(COALESCE(i.published_at, i.listed_at)) >= julianday('now', ?) "
+        "WHERE julianday(COALESCE(i.published_at, i.listed_at)) >= julianday('now', ?)"
+        + чужие + " "
         "GROUP BY e.id, день",
-        ("-{} days".format(окно), "-{} days".format(фон_дней)),
+        ("-{} days".format(окно), "-{} days".format(фон_дней), *параметры),
     ).fetchall()
     собрано: dict[int, dict[str, Any]] = {}
     for строка in строки:
@@ -1429,7 +1514,8 @@ __all__ = ("CACHE_KB", "DEFAULT_PATH", "KINDS", "LATE_COLUMNS", "SCHEMA", "STAMP
            "revise", "revisions", "revive", "save_enrichment", "save_snapshot", "save_vector",
            "set_fingerprint", "set_kinds", "set_quiet", "set_source", "snapshot_page", "snapshots",
            "source_enabled", "source_every", "source_states", "kinds_of", "stamp",
-           "set_topic_delivery", "set_user_sources", "source_allowed", "topics_of",
+           "set_source_mode", "set_topic_delivery", "set_user_sources",
+           "source_allowed", "source_mode", "topics_of",
            "toggle_notify", "user_sources", "vector_of", "bursts", "entities_top", "entity",
            "entity_days", "entity_items", "mark_digest", "set_digest", "sizes",
            "source_health", "summary", "index_size", "memory_mb", "delay_of", "set_delay",

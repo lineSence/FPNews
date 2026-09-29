@@ -16,6 +16,8 @@ import re
 import sqlite3
 from typing import Any
 
+from . import scope
+
 # Потолок строк на один запрос: одно ядро и 500 МБ не терпят выборки
 # «всё, что нашлось» [CORE-025].
 MAX_LIMIT = 200
@@ -122,7 +124,8 @@ def _any_of(words: str) -> str:
 def search(conn: sqlite3.Connection, query: str, *, source: str = "",
            since: str = "", until: str = "", topic_id: int | None = None,
            only_original: bool = False, only_revised: bool = False,
-           limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+           limit: int = 50, offset: int = 0,
+           user_id: int = 0) -> list[dict[str, Any]]:
     """Материалы по запросу, свежие и точные сверху.
 
     Заголовок весит больше лида, лид — больше тела: совпадение в теле
@@ -136,10 +139,16 @@ def search(conn: sqlite3.Connection, query: str, *, source: str = "",
     params: list[Any] = []
     where = ["items_fts MATCH ?"]
 
+    codes: list[str] = []
     if topic_id is not None:
-        topic = conn.execute(
-            "SELECT words, sources FROM topics WHERE id = ?", (topic_id,)
-        ).fetchone()
+        # Чужая тема — не наша тема: подборка слов принадлежит одному человеку,
+        # и адрес «?тема=N» не даёт права подглядывать чужой профиль.
+        свой = user_id == 0 or scope.тему_можно(conn, user_id, int(topic_id))
+        topic = None
+        if свой:
+            topic = conn.execute(
+                "SELECT words, sources FROM topics WHERE id = ?", (topic_id,)
+            ).fetchone()
         if topic is None:
             return []
         group = _any_of(topic["words"])
@@ -165,6 +174,12 @@ def search(conn: sqlite3.Connection, query: str, *, source: str = "",
         where.append("i.dup_of IS NULL")
     if only_revised:
         where.append("EXISTS (SELECT 1 FROM item_revisions r WHERE r.item_id = i.id)")
+    # Область видимости добавляется последней: её параметры обязаны идти
+    # в общем списке после всех слов темы и изданий, а перед LIMIT/OFFSET —
+    # иначе порядок «?» и значений разъедется, и фильтр сломается тихо.
+    хвост, параметры_области = scope.условие(conn, user_id)
+    if хвост:
+        where.append(хвост)
 
     sql = (
         "SELECT i.id, i.url, i.source, i.title, i.lead, i.published_at, i.listed_at, "
@@ -173,6 +188,7 @@ def search(conn: sqlite3.Connection, query: str, *, source: str = "",
         "ORDER BY bm25(items_fts, 4.0, 2.0, 1.0), COALESCE(i.published_at, i.listed_at) DESC "
         "LIMIT ? OFFSET ?".format(" AND ".join(where))
     )
+    params.extend(параметры_области)
     params.append(max(1, min(int(limit), MAX_LIMIT)))
     params.append(max(0, int(offset)))
     rows = conn.execute(sql, params).fetchall()
