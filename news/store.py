@@ -215,6 +215,25 @@ SCHEMA = (
         created_at  TEXT
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS feed_subs (
+        user_id    INTEGER NOT NULL,          -- кто хочет издание целиком
+        code       TEXT NOT NULL DEFAULT '',  -- код издания; пусто — все
+        created_at TEXT,                      -- ниже этой границы историю не играем
+        PRIMARY KEY (user_id, code)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS feed_subs_code ON feed_subs(code)",
+    """
+    CREATE TABLE IF NOT EXISTS topic_feedback (
+        topic_id   INTEGER NOT NULL,
+        item_id    INTEGER NOT NULL,
+        verdict    INTEGER NOT NULL,          -- 1 «в тему», 0 «не в тему»
+        user_id    INTEGER NOT NULL,
+        created_at TEXT,
+        PRIMARY KEY (topic_id, item_id)       -- один голос на материал в теме
+    )
+    """,
 )
 
 STAMPS = ("published_at", "listed_at", "fetched_at", "sent_at", "enriched_at")
@@ -260,6 +279,9 @@ LATE_COLUMNS = (
     # записан в работающей базе, роль проставляет `ensure` ниже: отбирать
     # доступ у своих при обновлении было бы сюрпризом.
     ("users", "role", "TEXT NOT NULL DEFAULT ''"),
+    # Шаг 16: темы стали профилями — стоп-слова и порог.
+    ("topics", "stopwords", "TEXT NOT NULL DEFAULT ''"),
+    ("topics", "threshold", "REAL NOT NULL DEFAULT 1"),
 )
 
 
@@ -655,7 +677,7 @@ def mark_query_seen(conn: sqlite3.Connection, query_id: int, last_item_id: int) 
 
 # Виды сообщений, которые можно выключить в интерфейсе. «Изменение» и
 # «запрос» намеренно в списке: человек вправе не хотеть досылок.
-KINDS = ("сырое", "дополнение", "изменение", "тоже_написали", "запрос")
+KINDS = ("сырое", "дополнение", "изменение", "тоже_написали", "запрос", "лента")
 
 
 def source_states(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
@@ -896,6 +918,150 @@ def set_topic_delivery(conn: sqlite3.Connection, topic_id: int, user_id: int, *,
         )
     conn.commit()
     return cursor.rowcount > 0
+
+
+# --- Подписки на издания целиком ---
+
+def feed_subs_of(conn: sqlite3.Connection, user_id: int) -> list[dict[str, Any]]:
+    """На какие издания человек подписан целиком. Пустой код — все издания."""
+    rows = conn.execute(
+        "SELECT code, created_at FROM feed_subs WHERE user_id = ? ORDER BY code",
+        (int(user_id),),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def follow_feed(conn: sqlite3.Connection, user_id: int, code: Any) -> bool:
+    """Подписать на издание целиком. True — подписка новая, False — была.
+
+    Момент подписки становится нижней границей: что появилось в базе раньше,
+    подписчику не рассылается. Иначе при первом включении прилетал бы архив.
+    """
+    код = str(code or "").strip().lower()
+    if код in ("все", "всё", "all"):
+        код = ""
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO feed_subs(user_id, code, created_at) VALUES(?,?,?)",
+        (int(user_id), код, now()),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def unfollow_feed(conn: sqlite3.Connection, user_id: int, code: Any) -> bool:
+    код = str(code or "").strip().lower()
+    if код in ("все", "всё", "all"):
+        код = ""
+    cursor = conn.execute(
+        "DELETE FROM feed_subs WHERE user_id = ? AND code = ?",
+        (int(user_id), код),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def feed_subscribers(conn: sqlite3.Connection, source: Any) -> list[dict[str, Any]]:
+    """Подписчики издания: подписанные на него и на «все издания» сразу."""
+    rows = conn.execute(
+        "SELECT user_id, code, created_at FROM feed_subs WHERE code IN ('', ?)",
+        (str(source or "").strip().lower(),),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+# --- Профили тем: слова, стоп-слова, порог ---
+
+def _topic_of(conn: sqlite3.Connection, topic_id: int, user_id: int) -> sqlite3.Row | None:
+    """Тема, если она принадлежит этому человеку. Чужую тему не отдаём."""
+    return conn.execute(
+        "SELECT * FROM topics WHERE id = ? AND user_id = ?", (int(topic_id), int(user_id))
+    ).fetchone()
+
+
+def _plain(word: str) -> str:
+    return str(word or "").strip().lower().replace("ё", "е")
+
+
+def topic_words_add(conn: sqlite3.Connection, topic_id: int, user_id: int,
+                    raw: Any) -> bool:
+    """Добавить слово в свою тему. Дубликат и мусор — False."""
+    слово = _plain(raw)
+    if not слово or " " in слово.replace(",", ""):
+        return False
+    row = _topic_of(conn, topic_id, user_id)
+    if row is None:
+        return False
+    have = [_plain(part) for part in str(row["words"] or "").split(",")]
+    stop = [_plain(part) for part in str(row["stopwords"] or "").split(",")]
+    if слово in have or слово in stop:
+        return False
+    было = str(row["words"] or "").strip().strip(",")
+    conn.execute("UPDATE topics SET words = ? WHERE id = ?",
+                 ((было + "," if было else "") + слово, int(topic_id)))
+    conn.commit()
+    return True
+
+
+def topic_stop_add(conn: sqlite3.Connection, topic_id: int, user_id: int,
+                   raw: Any) -> bool:
+    """Добавить стоп-слово в свою тему: совпавший кусок текста не считается."""
+    слово = _plain(raw)
+    if not слово:
+        return False
+    row = _topic_of(conn, topic_id, user_id)
+    if row is None:
+        return False
+    have = [_plain(part) for part in str(row["stopwords"] or "").split(",")]
+    if слово in have:
+        return False
+    было = str(row["stopwords"] or "").strip().strip(",")
+    conn.execute("UPDATE topics SET stopwords = ? WHERE id = ?",
+                 ((было + "," if было else "") + слово, int(topic_id)))
+    conn.commit()
+    return True
+
+
+def topic_threshold_set(conn: sqlite3.Connection, topic_id: int, user_id: int,
+                        value: Any) -> bool:
+    """Порог темы: сколько очков нужно материалу. Мусор — не меняется."""
+    try:
+        порог = float(str(value or "").strip().replace(",", "."))
+    except ValueError:
+        return False
+    if порог < 0 or порог > 100:
+        return False
+    if _topic_of(conn, topic_id, user_id) is None:
+        return False
+    conn.execute("UPDATE topics SET threshold = ? WHERE id = ?", (порог, int(topic_id)))
+    conn.commit()
+    return True
+
+
+def topic_feedback_add(conn: sqlite3.Connection, topic_id: int, item_id: int,
+                       verdict: Any, user_id: int) -> bool:
+    """Кнопка «в тему»/«не в тему» под сообщением. Считает только владелец темы."""
+    row = conn.execute("SELECT user_id FROM topics WHERE id = ?", (int(topic_id),)).fetchone()
+    if row is None or int(row["user_id"]) != int(user_id):
+        return False
+    conn.execute(
+        "INSERT OR REPLACE INTO topic_feedback(topic_id, item_id, verdict, user_id, created_at) "
+        "VALUES(?,?,?,?,?)",
+        (int(topic_id), int(item_id), 1 if str(verdict) in ("1", "True", "true") else 0,
+         int(user_id), now()),
+    )
+    conn.commit()
+    return True
+
+
+def feedback_texts(conn: sqlite3.Connection, topic_id: int, verdict: int = 1,
+                   limit: int = 50) -> list[str]:
+    """Заголовки и лиды материалов, отмеченных кнопкой. Пусто — не отмечали."""
+    rows = conn.execute(
+        "SELECT i.title, i.lead FROM topic_feedback f JOIN items i ON i.id = f.item_id "
+        "WHERE f.topic_id = ? AND f.verdict = ? ORDER BY f.created_at DESC LIMIT ?",
+        (int(topic_id), 1 if verdict else 0, int(limit)),
+    ).fetchall()
+    return ["{}. {}".format(row["title"], row["lead"]) for row in rows]
 
 
 def entities_top(conn: sqlite3.Connection, *, kind: str = "", query: str = "",
@@ -1268,4 +1434,6 @@ __all__ = ("CACHE_KB", "DEFAULT_PATH", "KINDS", "LATE_COLUMNS", "SCHEMA", "STAMP
            "entity_days", "entity_items", "mark_digest", "set_digest", "sizes",
            "source_health", "summary", "index_size", "memory_mb", "delay_of", "set_delay",
            "target_of", "set_target", "archive_span", "drop_old_snapshots", "compact",
-           "measurements")
+           "measurements", "feed_subs_of", "follow_feed", "unfollow_feed", "feed_subscribers",
+           "topic_words_add", "topic_stop_add", "topic_threshold_set", "topic_feedback_add",
+           "feedback_texts")

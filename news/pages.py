@@ -145,6 +145,7 @@ MENU = (
         ("/сводка", "Ежедневная сводка"),
         ("/телеграм", "Отдача в Telegram"),
         ("/запросы", "Сохранённые запросы"),
+        ("/подписки", "Подписки на издания"),
     )),
     ("Настройка", (
         ("/темы", "Мои темы"),
@@ -585,31 +586,77 @@ def home(conn: Any, user_id: int, mark: str, theme: str = "система",
 
 
 def topics_page(conn: Any, user_id: int, mark: str, theme: str = "система") -> str:
-    """Мои темы: слова, по которым нам приносят материалы."""
+    """Мои темы: профили слов с весами, стоп-словами и порогом."""
+    from . import topics as rules  # noqa: PLC0415
+
     rows = conn.execute(
-        "SELECT id, title, words FROM topics WHERE user_id = ? ORDER BY id", (user_id,)
+        "SELECT id, title, words, stopwords, threshold FROM topics "
+        "WHERE user_id = ? ORDER BY id", (user_id,)
     ).fetchall()
-    items = [
-        "<li><b>{}</b> — {} "
-        '<form class=строка method=post action="/темы/удалить" style="display:inline">'
-        '<input type=hidden name=метка value="{}">'
-        '<input type=hidden name=номер value="{}">'
-        "<button>убрать</button></form></li>".format(
-            html.escape(row["title"]), html.escape(row["words"]), mark, row["id"]
-        )
-        for row in rows
-    ]
+    items: list[str] = []
+    for row in rows:
+        known = rules.parse_words(row["words"] or "")
+        stop = rules.parse_words(row["stopwords"] or "")
+        совет = ""
+        if known:
+            picks = rules.suggest_words(known, stop,
+                                        store.feedback_texts(conn, int(row["id"])))
+            if picks:
+                формы = "".join(
+                    '<form class=строка method=post action="/темы/слово" '
+                    'style="display:inline">'
+                    '<input type=hidden name=метка value="{mark}">'
+                    '<input type=hidden name=номер value="{id}">'
+                    '<input type=hidden name=слово value="{word}">'
+                    "<button class=тихо>+{word} ({count})</button></form>".format(
+                        mark=mark, id=row["id"], word=html.escape(word), count=count)
+                    for word, count in picks
+                )
+                совет = ("<p class=тихо>Отзывы «в тему» предлагают слова кнопками: "
+                         '<div class=чипы>{}</div></p>').format(формы)
+        стоп_форма = (
+            '<form class=строка method=post action="/темы/стоп" style="display:inline">'
+            '<input type=hidden name=метка value="{mark}">'
+            '<input type=hidden name=номер value="{id}">'
+            '<input type=text name=стоп size=12 placeholder="стоп-слово">'
+            "<button class=тихо>—</button></form>"
+        ).format(mark=mark, id=row["id"])
+        порог_форма = (
+            '<form class=строка method=post action="/темы/порог" style="display:inline">'
+            '<input type=hidden name=метка value="{mark}">'
+            '<input type=hidden name=номер value="{id}">'
+            '<input type=number name=порог value="{value}" min=0 max=100 step=0.5 size=3>'
+            "<button class=тихо>порог</button></form>"
+        ).format(mark=mark, id=row["id"], value=float(row["threshold"] or 1))
+        убрать = (
+            '<form class=строка method=post action="/темы/удалить" style="display:inline">'
+            '<input type=hidden name=метка value="{}">'
+            '<input type=hidden name=номер value="{}">'
+            "<button class=тихо>убрать</button></form>"
+        ).format(mark, row["id"])
+        строка = "<b>{}</b> — {}".format(html.escape(row["title"]),
+                                          html.escape(row["words"] or ""))
+        if row["stopwords"]:
+            строка += "; стоп: {}".format(html.escape(row["stopwords"]))
+        items.append("<li>{} {порог} {стоп} {убрать}{совет}</li>".format(
+            строка, порог=порог_форма, стоп=стоп_форма, убрать=убрать, совет=совет))
     listing = "<ul>{}</ul>".format("".join(items)) if items else (
         "<p class=тихо>Тем пока нет. Добавьте первую — например, «дроны, бпла».</p>")
     form = (
         '<form class=строка method=post action="/темы/добавить">'
         '<input type=hidden name=метка value="{}">'
         '<input type=text name=слова placeholder="дроны, бпла, беспилотник" required>'
+        '<input type=text name=стоп size=12 placeholder="стоп-слова">'
+        '<input type=number name=порог value=1 min=0 max=100 step=0.5 size=3 title="порог">'
         "<button>Добавить</button></form>"
     ).format(mark)
     return page("Мои темы", listing + form +
                 "<p class=тихо>Слово ищется в любой форме: «дрон» найдёт «дроны» и "
-                "«дронов». Фраза в кавычках — целиком.</p>",
+                "«дронов», «нейросеть» — «нейросетями». Фраза ищется целиком. "
+                "Вес — «важное*3»: за одно совпадение три очка. Стоп-слово выбрасывает "
+                "совпавший кусок текста из подсчёта: тема «процесс» со стоп-словом "
+                "«процессор» не сработает на обзоре чипов. Порог — сколько очков нужно "
+                "материалу, чтобы уйти в отдачу; по умолчанию хватает одного слова.</p>",
                 theme, "/темы")
 
 
@@ -1058,12 +1105,14 @@ def changes_page(conn: Any, theme: str = "система", limit: int = 50) -> s
 
 
 def sources_page(conn: Any, mark: str, theme: str = "система",
-                 owner: bool = True) -> str:
+                 owner: bool = True, user_id: int = 0) -> str:
     """Источники: что опрашиваем, как часто, что выключено; добавить ленту."""
     from . import discover, sources  # noqa: PLC0415
 
     state = store.source_states(conn)
     added = {row["code"] for row in store.feeds(conn)}
+    mine = ({row["code"] for row in store.feed_subs_of(conn, user_id)}
+            if user_id else set())
     rows = []
     for code, source in sorted(sources.registry(conn).items()):
         current = state.get(code, {})
@@ -1090,20 +1139,28 @@ def sources_page(conn: Any, mark: str, theme: str = "система",
                 '<input type=hidden name=код value="{code}">'
                 "<button class=тихо>убрать</button></form>"
             ).format(mark=mark, code=html.escape(code))
+        подписка = ""
+        if user_id:
+            on = code in mine
+            подписка = toggle("/подписки/{}".format("убрать" if on else "добавить"),
+                              mark, {"код": code}, on,
+                              "целиком" if on else "не целиком")
         rows.append(
             "<tr><td>{name}</td><td>{count}</td><td>{last}</td>"
-            "<td>{настройка}</td><td>{тумблер} {убрать}</td></tr>".format(
+            "<td>{настройка}</td><td>{тумблер} {убрать}</td>"
+            "<td>{подписка}</td></tr>".format(
                 name=label(code, conn), count=int(last["всего"] or 0),
                 last=when(last["последний"]), настройка=настройка,
                 тумблер=toggle("/источники/переключить", mark, {"код": code}, enabled,
                                "опрашиваем" if enabled else "не опрашиваем")
                 if owner else ("опрашиваем" if enabled else "не опрашиваем"),
                 убрать=убрать,
+                подписка=подписка or ("<span class=тихо>—</span>"),
             )
         )
     table = (
         "<table><tr><th>издание</th><th>материалов</th><th>последний</th>"
-        "<th>интервал, с</th><th></th></tr>{}</table>"
+        "<th>интервал, с</th><th></th><th>в бот целиком</th></tr>{}</table>"
     ).format("".join(rows))
     панель = ""
     if owner:
@@ -1126,8 +1183,49 @@ def sources_page(conn: Any, mark: str, theme: str = "система",
                 "<p class=тихо>Выключенное издание не опрашивается вовсе — это настройка "
                 "сбора, а не фильтр выдачи. Интервал 0 означает «как задано в коде». "
                 "«Убрать» возвращается только к добавленным лентам: встроенные издания "
-                "выключаются тумблером, а их записи в архиве остаются в обоих случаях.</p>",
+                "выключаются тумблером, а их записи в архиве остаются в обоих случаях.</p>"
+                "<p class=тихо>Колонка «в бот целиком» — подписка на издание: каждый "
+                "новый материал уходит в бот без темы. Что появилось раньше подписки, "
+                "не приходит — только новое.</p>",
                 theme, "/источники")
+
+
+def subs_page(conn: Any, user_id: int, mark: str, theme: str = "система") -> str:
+    """Подписки на издания целиком: всё новое из выбранного уходит в бот."""
+    from . import sources as sources_module  # noqa: PLC0415
+
+    mine = {row["code"] for row in store.feed_subs_of(conn, user_id)}
+    rows = []
+    for code, source in sorted(sources_module.registry(conn).items()):
+        on = code in mine
+        rows.append(
+            "<tr><td>{label}</td><td><code>{code}</code></td><td>{кнопка}</td></tr>".format(
+                label=label(code, conn), code=html.escape(code),
+                кнопка=toggle("/подписки/{}".format("убрать" if on else "добавить"),
+                              mark, {"код": code}, on,
+                              "подписан" if on else "не подписан"),
+            )
+        )
+    table = (
+        "<table><tr><th>издание</th><th>код для бота</th><th></th></tr>{}</table>"
+    ).format("".join(rows))
+    всё = "подписан на всё" if "" in mine else "не подписан на всё"
+    панель = (
+        '<div class=панель><h3>Сразу все издания</h3>'
+        '<form class=строка method=post action="/подписки/{action}">'
+        '<input type=hidden name=метка value="{mark}">'
+        '<input type=hidden name=код value="">'
+        "<button>{всё}</button></form>"
+        "<p class=тихо>Подписка «всё» приносит каждый новый материал из каждого "
+        "опрашиваемого издания.</p></div>"
+    ).format(action="убрать" if "" in mine else "добавить", mark=mark, всё=всё)
+    return page("Подписки на издания",
+                "<h2>Издания целиком в Telegram</h2>" + панель + table +
+                "<p class=тихо>Подписка не проигрывает историю: уходит только то, "
+                "что появилось в базе после подписки. Тема и подписка на одно издание "
+                "не дублируются: материал уходит один раз — темой, если она сработала, "
+                "иначе подпиской.</p>",
+                theme, "/подписки")
 
 
 def telegram_page(conn: Any, user_id: int, mark: str, theme: str = "система") -> str:
@@ -1161,7 +1259,8 @@ def telegram_page(conn: Any, user_id: int, mark: str, theme: str = "систем
                 "<h2>Виды сообщений и тишина</h2>" + form +
                 "<p class=тихо>Виды: «сырое» — первое сообщение по заголовку, «дополнение» — "
                 "когда приехал текст, «изменение» — правка или снятие, «тоже_написали» — "
-                "перепечатка, «запрос» — находка по сохранённому запросу.</p>"
+                "перепечатка, «запрос» — находка по сохранённому запросу, «лента» — "
+                "материал по подписке на издание целиком.</p>"
                 "<p class=тихо>Задержка отдачи: ноль — слать сразу, 10 — подождать десять "
                 "минут после выхода, пока текст устоится. Отсчёт от времени публикации, "
                 "а если издание его не дало — от момента, когда мы увидели ссылку "

@@ -246,7 +246,7 @@ def csrf(token: str) -> str:
 # Разделы, куда возвращаемся после формы: список закрыт, чтобы адрес из
 # формы не превратился в редирект куда попало.
 _SECTIONS = ("/доступы", "/запросы", "/источники", "/сводка", "/телеграм", "/темы",
-             "/хранение")
+             "/подписки", "/хранение")
 
 
 def _number(raw: Any) -> int:
@@ -304,9 +304,24 @@ def route(conn: Any, request: Request) -> Response:
                 "Обновите страницу и повторите.", theme), status="400 Bad Request")
         section = "/" + request.path.strip("/").split("/")[0]
         if request.path == "/темы/добавить":
-            bot_module.add_topic(conn, user_id, request.form.get("слова", ""))
+            bot_module.add_topic(conn, user_id, request.form.get("слова", ""),
+                                 stop=request.form.get("стоп", ""),
+                                 threshold=request.form.get("порог", ""))
         elif request.path == "/темы/удалить":
             bot_module.drop_topic(conn, user_id, request.form.get("номер", ""))
+        elif request.path == "/темы/стоп":
+            store.topic_stop_add(conn, _number(request.form.get("номер")), user_id,
+                                 request.form.get("стоп", ""))
+        elif request.path == "/темы/порог":
+            store.topic_threshold_set(conn, _number(request.form.get("номер")), user_id,
+                                       request.form.get("порог", ""))
+        elif request.path == "/темы/слово":
+            store.topic_words_add(conn, _number(request.form.get("номер")), user_id,
+                                  request.form.get("слово", ""))
+        elif request.path == "/подписки/добавить":
+            store.follow_feed(conn, user_id, request.form.get("код", ""))
+        elif request.path == "/подписки/убрать":
+            store.unfollow_feed(conn, user_id, request.form.get("код", ""))
         elif request.path == "/выход":
             conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
             conn.commit()
@@ -384,6 +399,8 @@ def route(conn: Any, request: Request) -> Response:
         return Response(pages.access_page(conn, csrf(token), theme))
     if request.path == "/темы":
         return Response(pages.topics_page(conn, user_id, csrf(token), theme))
+    if request.path == "/подписки":
+        return Response(pages.subs_page(conn, user_id, csrf(token), theme))
     if request.path == "/задержки":
         return Response(pages.latency(conn, theme))
     if request.path == "/лента":
@@ -429,7 +446,7 @@ def route(conn: Any, request: Request) -> Response:
     if request.path == "/правки":
         return Response(pages.changes_page(conn, theme))
     if request.path == "/источники":
-        return Response(pages.sources_page(conn, csrf(token), theme, хозяин))
+        return Response(pages.sources_page(conn, csrf(token), theme, хозяин, user_id))
     if request.path == "/телеграм":
         return Response(pages.telegram_page(conn, user_id, csrf(token), theme))
     if request.path == "/запросы":
