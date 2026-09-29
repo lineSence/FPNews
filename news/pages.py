@@ -497,7 +497,7 @@ def _sources_panel(conn: Any) -> str:
 
     состояние = store.source_states(conn)
     строки = []
-    for code in sorted(sources_module.BY_CODE):
+    for code in sorted(sources_module.registry(conn)):
         текущее = состояние.get(code, {})
         последний = conn.execute(
             "SELECT COUNT(*) AS всего, MAX(listed_at) AS последний FROM items "
@@ -509,7 +509,7 @@ def _sources_panel(conn: Any) -> str:
             "<p>{dot} {name} <span class=тихо>{count} за сутки · {ago}</span></p>".format(
                 dot='<span style="color:var(--ok)">●</span>' if включён
                     else '<span class=тихо>○</span>',
-                name=label(code), count=int(последний["всего"] or 0),
+                name=label(code, conn), count=int(последний["всего"] or 0),
                 ago=html.escape(ago(последний["последний"])),
             )
         )
@@ -669,11 +669,18 @@ def latency(conn: Any, theme: str = "система") -> str:
                 theme, "/задержки")
 
 
-def label(code: Any) -> str:
-    """Человеческое название издания по коду источника."""
+def label(code: Any, conn: Any = None) -> str:
+    """Человеческое название издания по коду источника.
+
+    Названия встроенных живут в `deliver.LABEL`, добавленных в интерфейсе —
+    в базе: их приносит `conn`, когда он есть.
+    """
     from .deliver import LABEL  # noqa: PLC0415 — названия изданий живут там
 
-    return html.escape(LABEL.get(str(code), str(code or "—")))
+    имя = LABEL.get(str(code))
+    if not имя and conn is not None:
+        имя = store.feed_label(conn, code)
+    return html.escape(str(имя or str(code or "—")))
 
 
 def when(value: Any) -> str:
@@ -756,9 +763,9 @@ def _stream_form(conn: Any, user_id: int, flt: Any) -> str:
 
     издания = "".join(
         '<label><input type=checkbox name=издание value="{code}"{on}> {name}</label>'.format(
-            code=html.escape(code), name=label(code),
+            code=html.escape(code), name=label(code, conn),
             on=" checked" if code in flt.sources else "")
-        for code in sorted(sources_module.BY_CODE)
+        for code in sorted(sources_module.registry(conn))
     )
     темы = "".join(
         '<option value="{id}"{on}>{title}</option>'.format(
@@ -1052,12 +1059,13 @@ def changes_page(conn: Any, theme: str = "система", limit: int = 50) -> s
 
 def sources_page(conn: Any, mark: str, theme: str = "система",
                  owner: bool = True) -> str:
-    """Источники: что опрашиваем, как часто, что выключено."""
-    from . import sources as sources_module  # noqa: PLC0415
+    """Источники: что опрашиваем, как часто, что выключено; добавить ленту."""
+    from . import discover, sources  # noqa: PLC0415
 
     state = store.source_states(conn)
+    added = {row["code"] for row in store.feeds(conn)}
     rows = []
-    for code, source in sorted(sources_module.BY_CODE.items()):
+    for code, source in sorted(sources.registry(conn).items()):
         current = state.get(code, {})
         enabled = current.get("включён", True)
         every = int(current.get("интервал") or 0)
@@ -1074,23 +1082,51 @@ def sources_page(conn: Any, mark: str, theme: str = "система",
         ).format(mark=mark, code=html.escape(code),
                  every=every or int(source.interval)) if owner else "{} с".format(
                      every or int(source.interval))
+        убрать = ""
+        if owner and code in added:
+            убрать = (
+                '<form class=строка method=post action="/источники/удалить">'
+                '<input type=hidden name=метка value="{mark}">'
+                '<input type=hidden name=код value="{code}">'
+                "<button class=тихо>убрать</button></form>"
+            ).format(mark=mark, code=html.escape(code))
         rows.append(
             "<tr><td>{name}</td><td>{count}</td><td>{last}</td>"
-            "<td>{настройка}</td><td>{тумблер}</td></tr>".format(
-                name=label(code), count=int(last["всего"] or 0),
+            "<td>{настройка}</td><td>{тумблер} {убрать}</td></tr>".format(
+                name=label(code, conn), count=int(last["всего"] or 0),
                 last=when(last["последний"]), настройка=настройка,
                 тумблер=toggle("/источники/переключить", mark, {"код": code}, enabled,
                                "опрашиваем" if enabled else "не опрашиваем")
                 if owner else ("опрашиваем" if enabled else "не опрашиваем"),
+                убрать=убрать,
             )
         )
     table = (
         "<table><tr><th>издание</th><th>материалов</th><th>последний</th>"
         "<th>интервал, с</th><th></th></tr>{}</table>"
     ).format("".join(rows))
-    return page("Источники", table +
+    панель = ""
+    if owner:
+        результаты = "".join(
+            '<p class=тихо>{}</p>'.format(html.escape(строка))
+            for строка in discover.сводка())
+        панель = (
+            '<div class=панель><h3>Добавить издание</h3>'
+            '<form class=строка method=post action="/источники/добавить">'
+            '<input type=hidden name=метка value="{mark}">'
+            '<input type=text name=сайт size=28 placeholder="example.com">'
+            "<button>Найти ленту</button></form>"
+            "<p class=тихо>Лента ищется по правилам: сначала объявленная в разметке "
+            "главной страницы, затем стандартные пути — /feed/, /rss/. Найденную "
+            "программа проверит, замерит и подключит; результат придёт сообщением "
+            "в бот. Адрес ленты можно указать и целиком.</p>"
+            "{результаты}</div>"
+        ).format(mark=mark, результаты=результаты)
+    return page("Источники", table + панель +
                 "<p class=тихо>Выключенное издание не опрашивается вовсе — это настройка "
-                "сбора, а не фильтр выдачи. Интервал 0 означает «как задано в коде».</p>",
+                "сбора, а не фильтр выдачи. Интервал 0 означает «как задано в коде». "
+                "«Убрать» возвращается только к добавленным лентам: встроенные издания "
+                "выключаются тумблером, а их записи в архиве остаются в обоих случаях.</p>",
                 theme, "/источники")
 
 
@@ -1142,8 +1178,8 @@ def _sources_form(conn: Any, user_id: int, mark: str) -> str:
 
     chosen = store.user_sources(conn, user_id)
     boxes = '<div class=чипы>{}</div>'.format("".join(
-        chip("издание", code, label(code), not chosen or code in chosen)
-        for code in sorted(sources_module.BY_CODE)))
+        chip("издание", code, label(code, conn), not chosen or code in chosen)
+        for code in sorted(sources_module.registry(conn))))
     return (
         "<h2>Издания в отдаче</h2>"
         '<form method=post action="/телеграм/издания">'
@@ -1168,8 +1204,8 @@ def _topics_form(conn: Any, user_id: int, mark: str) -> str:
     for topic in mine:
         codes = {code.strip() for code in str(topic["sources"] or "").split(",") if code.strip()}
         boxes = '<div class=чипы>{}</div>'.format("".join(
-            chip("издание", code, label(code), not codes or code in codes)
-            for code in sorted(sources_module.BY_CODE)))
+            chip("издание", code, label(code, conn), not codes or code in codes)
+            for code in sorted(sources_module.registry(conn))))
         строки.append(
             '<form method=post action="/телеграм/тема"><div class=панель>'
             '<input type=hidden name=метка value="{mark}">'

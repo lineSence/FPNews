@@ -102,6 +102,7 @@ class Poll:
     body: str = ""
     conditional: bool = False  # ответ 304: дверь сказала «ничего нового»
     error: str = ""
+    url: str = ""  # финальный адрес после переходов: редирект бывает только по делу
 
     @property
     def ok(self) -> bool:
@@ -147,12 +148,14 @@ async def poll(session: httpx.AsyncClient, url: str, door: Door) -> Poll:
                 # Не ошибка сети и не отказ издания: дверь ведёт не туда,
                 # куда мы стучались, и разбирать этот ответ как ленту нельзя.
                 result = Poll(status=response.status_code, seconds=spent, size=0,
+                              url=str(response.url),
                               error="дверь увела на чужой хост: {}".format(
                                   urllib.parse.urlsplit(str(response.url)).netloc))
                 door.note(result)
                 return result
             if response.status_code == 304:
-                result = Poll(status=304, seconds=spent, size=0, conditional=True)
+                result = Poll(status=304, seconds=spent, size=0, conditional=True,
+                              url=str(response.url))
                 door.note(result)
                 return result
             куски: list[bytes] = []
@@ -167,7 +170,8 @@ async def poll(session: httpx.AsyncClient, url: str, door: Door) -> Poll:
             # тело даёт трафик впятеро больше настоящего.
             wire = getattr(response, "num_bytes_downloaded", 0) or всего
             if response.status_code != 200:
-                result = Poll(status=response.status_code, seconds=spent, size=wire)
+                result = Poll(status=response.status_code, seconds=spent, size=wire,
+                              url=str(response.url))
                 door.note(result)
                 return result
             door.etag = response.headers.get("etag", "")
@@ -175,10 +179,11 @@ async def poll(session: httpx.AsyncClient, url: str, door: Door) -> Poll:
             body = b"".join(куски).decode(response.encoding or "utf-8", "replace")
             result = Poll(
                 status=200, seconds=spent, size=wire, body=body,
+            url=str(response.url),
                 error="ответ обрезан потолком {} Б".format(MAX_BODY) if обрыв else "")
     except Exception as exc:  # noqa: BLE001 — чужая сеть [CORE-017]
         result = Poll(status=0, seconds=time.monotonic() - started, size=0,
-                      error=str(exc)[:200])
+                      error=str(exc)[:200] or type(exc).__name__)
         door.note(result)
         return result
     door.note(result)

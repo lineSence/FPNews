@@ -201,6 +201,20 @@ SCHEMA = (
         UNIQUE(item_id, kind)                  -- второе нажатие бесплатно
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS feeds (
+        code        TEXT PRIMARY KEY,         -- из домена: example.com → example
+        label       TEXT NOT NULL,            -- название, как в самой ленте
+        door        TEXT NOT NULL,            -- адрес ленты
+        kind        TEXT NOT NULL DEFAULT 'rss',
+        interval    REAL NOT NULL DEFAULT 15.0, -- по замеру двери
+        conditional INTEGER NOT NULL DEFAULT 0, -- есть ли Last-Modified / ETag
+        host        TEXT NOT NULL DEFAULT '', -- для достройки относительных ссылок
+        notice      TEXT NOT NULL DEFAULT '', -- пометка, которую несёт материал
+        added_by    INTEGER,                  -- кто попросил
+        created_at  TEXT
+    )
+    """,
 )
 
 STAMPS = ("published_at", "listed_at", "fetched_at", "sent_at", "enriched_at")
@@ -675,6 +689,79 @@ def source_every(conn: sqlite3.Connection, code: str) -> int:
     """Свой интервал издания в секундах. 0 — брать тот, что в коде."""
     row = conn.execute("SELECT every FROM source_state WHERE code = ?", (code,)).fetchone()
     return int(row["every"] or 0) if row is not None else 0
+
+
+# Ленты, добавленные на странице «Источники». Дверь и разбор — те же, что у
+# встроенных, но запись живёт в базе: править код ради каждого нового издания
+# значит требовать перезапуска всего проекта ради одной строки [NEWS-005].
+
+def feeds(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Добавленные ленты — для страницы и для проверки дублей."""
+    rows = conn.execute("SELECT code, label, door, interval, created_at "
+                        "FROM feeds ORDER BY created_at, code").fetchall()
+    return [dict(row) for row in rows]
+
+def feed_label(conn: sqlite3.Connection, code: str) -> str:
+    """Название добавленной ленты. Пусто — такой ленты нет."""
+    row = conn.execute("SELECT label FROM feeds WHERE code = ?",
+                       (str(code or ""),)).fetchone()
+    return str(row["label"] or "") if row is not None else ""
+
+def add_feed(conn: sqlite3.Connection, *, label: str, door: str, kind: str = "rss",
+             interval: float = 15.0, conditional: bool = False, host: str = "",
+             notice: str = "", added_by: int = 0) -> str:
+    """Записать добавленную ленту. Возвращает её код.
+
+    Код делается из домена: он нужен и в базе новостей, и в настройках
+    отдачи, и человеку в адресе страницы. Код встроенных источников не
+    занимается никогда: два источника с одним кодом — это одна выдача
+    напополам.
+    """
+    import re  # noqa: PLC0415
+
+    from . import sources  # noqa: PLC0415 — импорт здесь разрывает круг
+
+    домен = re.sub(r"[^a-z0-9]+", "",
+                   str(host or "").lower().removeprefix("www.").split(".")[0])
+    base = домен or "feed"
+    taken = set(sources.BY_CODE) | {str(row["code"]) for row in
+                                    conn.execute("SELECT code FROM feeds")}
+    code, номер = base, 1
+    while code in taken:
+        номер += 1
+        code = "{}-{}".format(base, номер)
+    conn.execute(
+        "INSERT INTO feeds(code, label, door, kind, interval, conditional, host, "
+        "notice, added_by, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (code, str(label or ""), str(door or ""), kind or "rss",
+         float(interval or 15.0), 1 if conditional else 0, str(host or ""),
+         str(notice or ""), int(added_by or 0) or None, now()),
+    )
+    conn.commit()
+    return code
+
+def drop_feed(conn: sqlite3.Connection, code: str) -> bool:
+    """Убрать добавленную ленту. Встроенный источник убрать нельзя."""
+    cursor = conn.execute("DELETE FROM feeds WHERE code = ?", (str(code or ""),))
+    if cursor.rowcount:
+        conn.execute("DELETE FROM source_state WHERE code = ?", (str(code or ""),))
+        conn.commit()
+    return cursor.rowcount > 0
+
+def custom_sources(conn: sqlite3.Connection) -> list[Any]:
+    """Добавленные ленты как Source: сторожа и страницы различия не видят."""
+    from . import sources  # noqa: PLC0415 — импорт здесь разрывает круг
+
+    out = []
+    for row in conn.execute("SELECT code, label, door, kind, interval, conditional, "
+                            "host, notice FROM feeds"):
+        out.append(sources.Source(
+            code=str(row["code"]), label=str(row["label"] or row["code"]),
+            door=str(row["door"]), kind=str(row["kind"] or "rss"),
+            interval=float(row["interval"] or 15.0),
+            conditional=bool(row["conditional"]), host=str(row["host"] or ""),
+            notice=str(row["notice"] or "")))
+    return out
 
 
 def kinds_of(conn: sqlite3.Connection, user_id: int) -> set[str]:

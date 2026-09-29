@@ -26,7 +26,7 @@ from typing import Any
 
 import diag
 
-from . import fetch, sources, telegram
+from . import fetch, sources, store, telegram
 
 
 async def run_source(
@@ -88,11 +88,12 @@ async def run_source(
     }
 
 
-async def probe(codes: list[str], times: int, every: float, use_fallback: bool) -> list[dict]:
+async def probe(known: dict, codes: list[str], times: int, every: float,
+                use_fallback: bool) -> list[dict]:
     out: list[dict[str, Any]] = []
     async with fetch.client() as session:
         for code in codes:
-            source = sources.BY_CODE[code]
+            source = known[code]
             url = source.fallback if use_fallback else source.door
             print("{} — {}".format(source.label, url))
             out.append(await run_source(session, source, times, every, use_fallback))
@@ -106,19 +107,24 @@ def main(argv: Any = None) -> int:
     parser.add_argument("-n", "--times", type=int, default=1, help="сколько заходов")
     parser.add_argument("-e", "--every", type=float, default=0.0, help="пауза между заходами, с")
     parser.add_argument("--fallback", action="store_true", help="проверить запасную дверь")
+    parser.add_argument("--db", default=str(store.DEFAULT_PATH), help="файл базы")
     parser.add_argument("--diag", action="store_true", help="писать события в data/diag")
     args = parser.parse_args(argv)
 
     telegram.hush()
-    codes = args.source or [source.code for source in sources.ALL]
-    unknown = [code for code in codes if code not in sources.BY_CODE]
+    # Мерить можно и добавленные в интерфейсе ленты: они в базе, а не в коде.
+    conn = store.connect(args.db)
+    known = sources.registry(conn)
+    conn.close()
+    codes = args.source or sorted(known)
+    unknown = [code for code in codes if code not in known]
     if unknown:
         print("не знаю источников: {}".format(", ".join(unknown)))
         return 1
     every = args.every if args.every else max(s.interval for s in sources.ALL)
     if args.diag:
         diag.start("пробник дверей")
-    summary = asyncio.run(probe(codes, max(1, args.times), every, args.fallback))
+    summary = asyncio.run(probe(known, codes, max(1, args.times), every, args.fallback))
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     if args.diag:
         path = diag.finish(замеров=len(summary))

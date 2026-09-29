@@ -25,7 +25,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import bridge, guard, pages, store
+from . import bridge, discover, guard, pages, store
 
 log = logging.getLogger("fpnews.web")
 
@@ -339,6 +339,16 @@ def route(conn: Any, request: Request) -> Response:
         elif request.path == "/источники/интервал":
             store.set_source(conn, request.form.get("код", ""),
                              every=_number(request.form.get("секунд")))
+        elif request.path == "/источники/добавить":
+            # Поиск ленты ходит в сеть по чужим адресам и занимает секунды:
+            # страница отвечает сразу, а ходит отдельный контур [NEWS-002].
+            discover.попросить((request.form.get("сайт", "") or "").strip(), user_id)
+        elif request.path == "/источники/удалить":
+            code = (request.form.get("код", "") or "").strip()
+            if store.drop_feed(conn, code):
+                # Сторожа убранной ленты останавливаем сразу: без этого он
+                # продолжал бы опрашивать дверь до перезапуска службы.
+                discover.погасить(code)
         elif request.path == "/телеграм/сохранить":
             store.set_kinds(conn, user_id, request.all_of("вид"))
             store.set_quiet(conn, user_id, request.form.get("с", ""), request.form.get("по", ""))

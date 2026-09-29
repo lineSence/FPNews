@@ -42,7 +42,8 @@ HELP = (
     "<b>/сводка</b> — что я пропустил; «/сводка 09:00» — присылать каждый день\n"
     "<b>/вход</b> — ссылка в веб-интерфейс\n\n"
     "Владельцу: <b>/пригласить</b> Имя — ключ для нового человека, "
-    "<b>/доступы</b> — кому он выдан.\n\n"
+    "<b>/доступы</b> — кому он выдан, <b>/источник</b> сайт — подключить "
+    "ленту нового издания.\n\n"
     "Тема ловит слова в любой форме: «дрон» найдёт «дроны» и «дронов». "
     "Фраза в кавычках ищется целиком.\n\n"
     "Под каждой новостью три кнопки — выжимка, цитата, оценка. "
@@ -210,6 +211,23 @@ def доступы(conn: sqlite3.Connection, user_id: int) -> str:
     )
 
 
+def источник(conn: sqlite3.Connection, user_id: int, tail: str) -> str:
+    """«/источник сайт» — найти ленту и подключить издание. Только владельцу."""
+    import html  # noqa: PLC0415
+
+    from . import discover  # noqa: PLC0415 — импорт здесь разрывает круг
+
+    if not access.владелец(conn, user_id):
+        return "Источники подключает только владелец."
+    сайт = (tail or "").strip()
+    if not сайт:
+        return "Укажите сайт: <code>/источник example.com</code> — или адрес ленты целиком."
+    if not discover.попросить(сайт, user_id):
+        return "Очередь поиска переполнена — подождите пару минут и попробуйте снова."
+    # Ответ уходит с разметкой HTML: слово человека — данные, не разметка.
+    return "Ищу ленту на {} — о результате напишу сюда.".format(html.escape(сайт))
+
+
 def login_link(conn: sqlite3.Connection, user_id: int) -> str:
     """Одноразовая ссылка в веб. Пароля нет — значит нечему утечь."""
     from . import pages, web  # noqa: PLC0415 — импорт здесь разрывает круг
@@ -240,6 +258,8 @@ def answer(conn: sqlite3.Connection, user_id: int, name: str, text: str) -> str:
         return пригласить(conn, user_id, tail)
     if command in ("доступы", "access"):
         return доступы(conn, user_id)
+    if command in ("источник", "feed"):
+        return источник(conn, user_id, tail)
     if command in ("добавить", "add"):
         return add_topic(conn, user_id, tail)
     if command in ("темы", "topics"):
@@ -318,4 +338,4 @@ async def serve(bot: Any, conn: sqlite3.Connection, stop: Any, rounds: int = 0,
 
 __all__ = ("HELP", "ЗАКРЫТО", "add_topic", "answer", "drop_topic", "ensure_user",
            "latency_text", "list_topics", "login_link", "press", "serve",
-           "доступы", "пригласить", "принять_ключ")
+           "доступы", "источник", "пригласить", "принять_ключ")
