@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from news import access
 from news import bot as bot_module
 from news import deliver, search, store, stream, web
 
@@ -17,6 +18,8 @@ from news import deliver, search, store, stream, web
 def _conn(tmp_path: Path):
     conn = store.connect(tmp_path / "db.sqlite3")
     bot_module.ensure_user(conn, 7, "Владелец")
+    # Владелец: страница ленты теперь личная, а эти тесты про механику отбора
+    access.назначить(conn, 7, access.ВЛАДЕЛЕЦ)
     return conn
 
 

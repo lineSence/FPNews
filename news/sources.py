@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 from dataclasses import dataclass
 from xml.etree import ElementTree
 
@@ -23,6 +24,15 @@ CONTENT = "{http://purl.org/rss/1.0/modules/content/}encoded"
 # Деловой Петербург кладёт полный текст в тег для Яндекса. Нам он тоже
 # годится: это тот же материал, и он снимает поход на страницу.
 YANDEX_FULL = "{http://news.yandex.ru}full-text"
+# Схемы, которые мы согласны считать ссылкой на материал. Всё остальное —
+# `javascript:`, `data:`, `mailto:` — не адрес новости, а способ выполнить
+# чужой код в браузере читателя или в клиенте Telegram [CORE-016]. Проверка
+# стоит здесь, а не на странице: адрес из ленты уезжает и в базу, и в бот, и
+# чинить его в каждой точке вывода поздно.
+СХЕМЫ = ("http://", "https://")
+# Схема в начале строки: «javascript:», «data:», «tel:». Нужна, чтобы
+# отличить чужую схему от обычной относительной ссылки «2026/09/24/1/».
+SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:")
 ANCHOR = re.compile(r"<a\b[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>", re.S | re.I)
 TAG = re.compile(r"<[^>]+>|<!--.*?-->", re.S)
 SPACE = re.compile(r"\s+")
@@ -162,6 +172,20 @@ PAPER = Source(
 ALL = (MEDUZA, FONTANKA, INTERFAX, DP, RIA, MOIKA, PAPER)
 BY_CODE = {source.code: source for source in ALL}
 
+def registry(conn: Any) -> dict[str, Source]:
+    """Все источники: встроенные из кода и добавленные в интерфейсе из базы.
+
+    Код и разбор у них одинаковый, разница только в том, кто записал —
+    человек в форме или мы в этой странице. Собираем их в один словарь на
+    момент вызова, чтобы сторожа и страницы видели одно и то же `[NEWS-005]`.
+    """
+    from . import store  # noqa: PLC0415 — импорт здесь разрывает круг
+
+    out = dict(BY_CODE)
+    for source in store.custom_sources(conn):
+        out[source.code] = source
+    return out
+
 
 def canonical(url: str, host: str = "") -> str:
     """Адрес без меток переходов и якоря, с полным именем хоста.
@@ -169,13 +193,22 @@ def canonical(url: str, host: str = "") -> str:
     Без этого один материал из ленты, из письма и со страницы суток выглядит
     как три разных: `?from=main`, `?utm_source=`, `#comments`.
     """
-    raw = (url or "").strip()
+    raw = "".join(знак for знак in (url or "").strip()
+                  if ord(знак) >= 32 and ord(знак) != 127)
     if not raw:
         return ""
     if raw.startswith("//"):
         raw = "https:" + raw
     elif raw.startswith("/"):
         raw = host.rstrip("/") + raw
+    elif host and not SCHEME.match(raw):
+        # Относительная ссылка без ведущей косой: у Фонтанки в разметке
+        # встречается и такая.
+        raw = host.rstrip("/") + "/" + raw
+    if not raw.lower().startswith(СХЕМЫ):
+        # Пусто, а не исключение: разбор ленты не должен падать от одной
+        # странной ссылки, а сторож пропустит такую строку [CORE-017].
+        return ""
     raw = raw.split("#", 1)[0]
     head, _, query = raw.partition("?")
     if query:
@@ -205,29 +238,72 @@ def extract(source: Source, body: str) -> list[Found]:
 
 
 def _from_rss(body: str, source: Source) -> list[Found]:
+    """Разбор XML-ленты: RSS и Atom, с любыми пространствами имён.
+
+    Теги ленты расставляют по-разному: RSS 2.0 обходится без пространств,
+    RSS 1.0 живёт в своих, Atom — в пространстве w3.org. Точное имя тега —
+    свойство чужой разметки, поэтому сравниваем местные имена: `item`,
+    `entry`, `link`, `title` — без префиксов `[CORE-017]`.
+    """
     try:
         root = ElementTree.fromstring(body)
     except ElementTree.ParseError:
         return []
     out: list[Found] = []
     seen: set[str] = set()
-    for item in root.iter("item"):
-        link = canonical((item.findtext("link") or "").strip(), source.host)
+    entries = _имена(root, "item") or _имена(root, "entry")
+    for item in entries:
+        link = canonical((_текст(item, "link").strip() or _ссылка(item)), source.host)
         if not link or link in seen:
             continue
         seen.add(link)
-        body = text_of(item.findtext(CONTENT) or item.findtext(YANDEX_FULL) or "")
-        lead = text_of(item.findtext("description") or "")
+        whole = text_of(_текст(item, "encoded") or _текст(item, "full-text")
+                        or _текст(item, "content") or "")
+        lead = text_of(_текст(item, "description") or _текст(item, "summary") or "")
         out.append(
             Found(
                 url=link,
-                title=(item.findtext("title") or "").strip(),
-                published_at=(item.findtext("pubDate") or "").strip(),
-                lead=lead or body[:400],
-                body=body,
+                title=(_текст(item, "title") or "").strip(),
+                published_at=(_текст(item, "pubDate") or _текст(item, "published")
+                              or _текст(item, "updated") or "").strip(),
+                lead=lead or whole[:400],
+                body=whole,
             )
         )
     return out
+
+def _местное(tag: str) -> str:
+    """Имя тега без пространства имён. Ленты их расставляют по-разному."""
+    return str(tag or "").rsplit("}", 1)[-1]
+
+def _имена(root: Any, name: str) -> list[Any]:
+    """Все элементы с этим именем — независимо от пространства имён."""
+    return [node for node in root.iter() if _местное(node.tag) == name]
+
+def _текст(node: Any, name: str) -> str:
+    """Текст первого вложенного тега с этим именем. Пусто — тега не было."""
+    for child in node:
+        if _местное(child.tag) == name:
+            return child.text or ""
+    return ""
+
+def _ссылка(node: Any) -> str:
+    """Адрес из Atom-тега `<link>`: он в атрибуте, и их бывает несколько.
+
+    Атрибут `rel` без значения и со значением `alternate` — сам материал;
+    прочие (enclosure, replies) адресом новости не являются.
+    """
+    any_link = ""
+    for child in node:
+        if _местное(child.tag) != "link":
+            continue
+        href = (child.get("href") or "").strip()
+        if not href:
+            continue
+        if (child.get("rel") or "alternate") == "alternate":
+            return href
+        any_link = any_link or href
+    return any_link
 
 
 def _from_html(body: str, source: Source) -> list[Found]:
@@ -260,9 +336,12 @@ __all__ = (
     "PAPER",
     "RIA",
     "YANDEX_FULL",
+    "СХЕМЫ",
+    "SCHEME",
     "Found",
     "MEDUZA",
     "Source",
+    "registry",
     "canonical",
     "extract",
     "text_of",

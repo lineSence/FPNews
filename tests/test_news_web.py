@@ -7,6 +7,7 @@ from pathlib import Path
 
 import httpx
 
+from news import access
 from news import bot as bot_module
 from news import pages, store, web
 
@@ -14,6 +15,8 @@ from news import pages, store, web
 def _db(tmp_path: Path):
     conn = store.connect(tmp_path / "db.sqlite3")
     bot_module.ensure_user(conn, 7, "Владелец")
+    # Владелец: поиск, карточки и сюжеты идут через личную область видимости
+    access.назначить(conn, 7, access.ВЛАДЕЛЕЦ)
     return conn
 
 

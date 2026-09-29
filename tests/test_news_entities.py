@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from news import access
 from news import bot as bot_module
 from news import entities, store, web
 
@@ -15,6 +16,8 @@ from news import entities, store, web
 def _conn(tmp_path: Path):
     conn = store.connect(tmp_path / "db.sqlite3")
     bot_module.ensure_user(conn, 7, "Владелец")
+    # Владелец: страницы сущностей идут через личную область видимости
+    access.назначить(conn, 7, access.ВЛАДЕЛЕЦ)
     return conn
 
 

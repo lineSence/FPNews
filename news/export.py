@@ -11,6 +11,12 @@ Excel, в блокнот следователя, в отдельную заме�
 
 Потолок строк тот же, что на странице: выгрузка не должна превращаться в
 способ выгрести базу одним запросом на одном ядре [CORE-025].
+
+Про формулы. Excel и LibreOffice считают ячейку, начинающуюся с «=», «+»,
+«-» или «@», формулой и выполняют её при открытии файла. Заголовки мы берём
+с чужих сайтов, то есть в ячейку попадает строка, которую писали не мы: это
+готовая инъекция формулы [CORE-016]. Поэтому такие значения уезжают с
+одиночной кавычкой впереди — таблица покажет текст, а не выполнит его.
 """
 
 from __future__ import annotations
@@ -23,18 +29,26 @@ from typing import Any
 from . import stream
 
 MAX_ROWS = 2000
+# Знаки, с которых таблица начинает считать ячейку формулой. Табуляция и
+# возврат каретки в списке потому, что ими можно сдвинуть начало строки.
+ФОРМУЛА = ("=", "+", "-", "@", "\t", "\r")
 COLUMNS = ("id", "заголовок", "источник", "опубликовано", "замечено", "url",
            "перепечатка_из", "правок", "снято")
 
 
-def rows(conn: Any, query: dict[str, str], many: Any = None) -> list[dict[str, Any]]:
-    """Строки под тот же фильтр, что и на странице ленты."""
+def rows(conn: Any, query: dict[str, str], many: Any = None,
+         user_id: int = 0) -> list[dict[str, Any]]:
+    """Строки под тот же фильтр, что и на странице ленты.
+
+    Выгрузка — та же лента, только файлом, и область видимости у неё та же:
+    человек выгружает своё, а не весь архив [CORE-016].
+    """
     flt = stream.read(query, many)
     out: list[dict[str, Any]] = []
     страница = flt.page
     while len(out) < MAX_ROWS:
         flt.page = страница
-        порция = stream.select(conn, flt)
+        порция = stream.select(conn, flt, user_id)
         if not порция:
             break
         out.extend(порция[:stream.PER_PAGE])
@@ -44,13 +58,19 @@ def rows(conn: Any, query: dict[str, str], many: Any = None) -> list[dict[str, A
     return out[:MAX_ROWS]
 
 
+def safe_cell(value: Any) -> str:
+    """Значение ячейки, которое таблица не станет считать формулой."""
+    текст = "" if value is None else str(value)
+    return "'" + текст if текст[:1] in ФОРМУЛА else текст
+
+
 def as_csv(data: list[dict[str, Any]]) -> str:
     buffer = io.StringIO()
     writer = csv.DictWriter(buffer, fieldnames=COLUMNS, delimiter=";", extrasaction="ignore",
                             lineterminator="\r\n")
     writer.writeheader()
     for row in data:
-        writer.writerow({name: row.get(name, "") for name in COLUMNS})
+        writer.writerow({name: safe_cell(row.get(name, "")) for name in COLUMNS})
     # BOM — чтобы Excel не открыл кириллицу кракозябрами.
     return "\ufeff" + buffer.getvalue()
 
@@ -60,9 +80,9 @@ def as_json(data: list[dict[str, Any]]) -> str:
 
 
 def make(conn: Any, query: dict[str, str], kind: str = "csv",
-         many: Any = None) -> tuple[str, str, str]:
+         many: Any = None, user_id: int = 0) -> tuple[str, str, str]:
     """Тело, тип содержимого и имя файла."""
-    data = rows(conn, query, many)
+    data = rows(conn, query, many, user_id)
     if str(kind).lower() == "json":
         return as_json(data), "application/json; charset=utf-8", "лента.json"
     return as_csv(data), "text/csv; charset=utf-8", "лента.csv"
@@ -71,7 +91,8 @@ def make(conn: Any, query: dict[str, str], kind: str = "csv",
 DOSSIER_ITEMS = 200
 
 
-def dossier(conn: Any, query: dict[str, str], many: Any = None) -> tuple[str, str]:
+def dossier(conn: Any, query: dict[str, str], many: Any = None,
+            user_id: int = 0) -> tuple[str, str]:
     """Досье одним файлом: заголовок, счёт, хронология, правки, соседи.
 
     Зачем отдельно от таблицы. Таблица хороша, когда считают; когда пишут
@@ -93,14 +114,14 @@ def dossier(conn: Any, query: dict[str, str], many: Any = None) -> tuple[str, st
             return "", ""
         заголовок = str(карточка["name"])
         подпись = "сущность, вид: {}".format(карточка["kind"])
-        строки = store.entity_items(conn, int(номер), DOSSIER_ITEMS)
-        дни = store.entity_days(conn, int(номер), 30)
+        строки = store.entity_items(conn, int(номер), DOSSIER_ITEMS, user_id=user_id)
+        дни = store.entity_days(conn, int(номер), 30, user_id=user_id)
     else:
         заголовок = str(query.get("q") or "").strip()
         if not заголовок:
             return "", ""
         подпись = "запрос по словам"
-        строки = rows(conn, dict(query, q=заголовок), many)[:DOSSIER_ITEMS]
+        строки = rows(conn, dict(query, q=заголовок), many, user_id)[:DOSSIER_ITEMS]
     издания: dict[str, int] = {}
     for строка in строки:
         код = str(строка.get("source") or строка.get("источник") or "")
@@ -171,5 +192,5 @@ def _dossier_changes(conn: Any, номера: list[int], limit: int = 50) -> lis
     return строки
 
 
-__all__ = ("COLUMNS", "DOSSIER_ITEMS", "MAX_ROWS", "as_csv", "as_json", "dossier", "make",
-           "rows")
+__all__ = ("COLUMNS", "DOSSIER_ITEMS", "MAX_ROWS", "ФОРМУЛА", "as_csv", "as_json",
+           "dossier", "make", "rows", "safe_cell")

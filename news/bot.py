@@ -1,6 +1,9 @@
-"""Бот: подписки на темы. Один бот на всех, выдача индивидуальная.
+"""Бот: подписки на темы и меню управления. Один бот на всех, выдача личная.
 
-Команды нарочно короткие и русские — ими пользуются с телефона:
+Всё управление живёт в меню кнопок — его открывает команда /меню, и
+печатать аргументы не нужно: экраны, три состояния издания, диалоги для
+текста [NEWS-018]. Команды нарочно короткие и русские — ими пользуются
+с телефона те, кто привык печатать:
 
     /старт          — завести себя
     /темы           — список своих тем
@@ -9,8 +12,7 @@
     /задержка       — как быстро доходят новости
     /сводка 09:00   — ежедневная сводка вместо потока
 
-Команд управления источниками нет: список изданий общий и меняется в коде, а
-не пользователем. Что своё у каждого — темы и подписка `[NEWS-005]`.
+Что своё у каждого — темы и подписка `[NEWS-005]`.
 
 Бот закрыт. Незнакомому человеку он отвечает одной фразой и не заводит
 учётку: войти можно только по личному приглашению владельца, командой
@@ -23,6 +25,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import sqlite3
 from typing import Any
@@ -35,18 +38,14 @@ log = logging.getLogger("fpnews.bot")
 
 HELP = (
     "Я приношу новости выбранных изданий по вашим темам.\n\n"
-    "<b>/добавить</b> слова через запятую — новая тема\n"
-    "<b>/темы</b> — список\n"
-    "<b>/удалить</b> номер — убрать тему\n"
-    "<b>/задержка</b> — как быстро доходят новости\n"
-    "<b>/сводка</b> — что я пропустил; «/сводка 09:00» — присылать каждый день\n"
-    "<b>/вход</b> — ссылка в веб-интерфейс\n\n"
-    "Владельцу: <b>/пригласить</b> Имя — ключ для нового человека, "
-    "<b>/доступы</b> — кому он выдан.\n\n"
-    "Тема ловит слова в любой форме: «дрон» найдёт «дроны» и «дронов». "
-    "Фраза в кавычках ищется целиком.\n\n"
-    "Под каждой новостью три кнопки — выжимка, цитата, оценка. "
-    "Модель работает только по нажатию и только на текст этой новости."
+    "Всё управление — кнопками: <b>/меню</b>. Печатать команды не нужно: "
+    "издания, темы, сводка, запросы, доступы — всё экранами и кнопками.\n\n"
+    "Команды для тех, кто привык печатать: <b>/темы</b>, <b>/подписки</b>, "
+    "<b>/сводка</b>, <b>/лента</b>, <b>/источник</b>, <b>/вход</b>. "
+    "Тема ловит слова в любой форме: «дрон» найдёт и «дроны», и «дронов».\n\n"
+    "Под каждой новостью кнопки — «в тему / не в тему» и три действия: "
+    "выжимка, цитата, оценка. Модель работает только по нажатию и только "
+    "на текст этой новости."
 )
 
 # Один и тот же ответ незнакомому — и на «/старт», и на неподошедший ключ, и
@@ -75,29 +74,47 @@ def ensure_user(conn: sqlite3.Connection, user_id: int, name: str = "") -> None:
     conn.commit()
 
 
-def add_topic(conn: sqlite3.Connection, user_id: int, raw: str) -> str:
-    words = topics.parse_words(raw)
-    if not words:
+def add_topic(conn: sqlite3.Connection, user_id: int, raw: str, *,
+               stop: str = "", threshold: Any = None) -> str:
+    profile = topics.parse_profile(raw)
+    if not profile:
         return "Нужны слова: <code>/добавить дроны, бпла</code>"
-    title = words[0]
+    стоп = topics.parse_words(stop)
+    try:
+        порог = float(str(threshold or "").strip().replace(",", "."))
+    except ValueError:
+        порог = 1.0
+    title = profile[0][0]
+    words = ", ".join(
+        word if weight == 1.0 else "{}*{}".format(word, int(weight) if weight == int(weight) else weight)
+        for word, weight in profile
+    )
     conn.execute(
-        "INSERT INTO topics(user_id, title, words, created_at) VALUES(?,?,?,?)",
-        (user_id, title, ", ".join(words), store.now()),
+        "INSERT INTO topics(user_id, title, words, stopwords, threshold, created_at) "
+        "VALUES(?,?,?,?,?,?)",
+        (user_id, title, words, ", ".join(стоп), max(0.0, порог), store.now()),
     )
     conn.commit()
-    return "Тема «{}» добавлена: {}".format(title, ", ".join(words))
+    answer = "Тема «{}» добавлена: {}".format(title, words)
+    if стоп:
+        answer += "; стоп-слова: {}".format(", ".join(стоп))
+    return answer
 
 
 def list_topics(conn: sqlite3.Connection, user_id: int) -> str:
     rows = conn.execute(
-        "SELECT id, title, words, enabled FROM topics WHERE user_id = ? ORDER BY id",
+        "SELECT id, title, words, stopwords, threshold, enabled "
+        "FROM topics WHERE user_id = ? ORDER BY id",
         (user_id,),
     ).fetchall()
     if not rows:
         return "Тем пока нет. <code>/добавить дроны, бпла</code>"
     lines = [
-        "{}. <b>{}</b> — {}{}".format(
-            row["id"], row["title"], row["words"], "" if row["enabled"] else " (выключена)"
+        "{}. <b>{}</b> — {}{}{}{}".format(
+            row["id"], row["title"], row["words"],
+            "; стоп: {}".format(row["stopwords"]) if row["stopwords"] else "",
+            "; порог {}".format(row["threshold"]) if row["threshold"] and float(row["threshold"]) != 1 else "",
+            "" if row["enabled"] else " (выключена)",
         )
         for row in rows
     ]
@@ -114,6 +131,82 @@ def drop_topic(conn: sqlite3.Connection, user_id: int, raw: str) -> str:
     )
     conn.commit()
     return "Удалено" if cursor.rowcount else "Такой темы у вас нет"
+
+
+def подписки(conn: sqlite3.Connection, user_id: int) -> str:
+    """На какие издания человек подписан целиком."""
+    from . import sources  # noqa: PLC0415 — нужен только здесь
+
+    subs = store.feed_subs_of(conn, user_id)
+    if not subs:
+        return ("Подписок на издания целиком нет. <code>/подписаться meduza</code> — "
+                "всё из издания; <code>/подписаться всё</code> — из всех.")
+    метки = {code: source.label for code, source in sources.registry(conn).items()}
+    lines = []
+    for line in subs:
+        code = str(line["code"] or "")
+        name = "все издания целиком" if not code else метки.get(code, code)
+        lines.append("— {}".format(name))
+    return "Подписки на издания целиком:\n" + "\n".join(lines)
+
+
+def подписаться(conn: sqlite3.Connection, user_id: int, tail: str) -> str:
+    """Оформить подписку на издание целиком."""
+    from . import sources  # noqa: PLC0415 — нужен только здесь
+
+    code = tail.strip().lower()
+    if code in ("все", "всё", "all"):
+        code = ""
+    if code and code not in sources.registry(conn):
+        return ("Такого издания нет: {}. Возможны: <code>{}</code>".format(
+            html.escape(code), ", ".join(sorted(sources.registry(conn))[:8]))
+        )
+    if not store.follow_feed(conn, user_id, code):
+        return "Вы уже на это подписаны."
+    name = "все издания" if not code else sources.registry(conn)[code].label
+    return ("Подписка оформлена: {}. Что появилось в базе раньше подписки, "
+            "не придёт — только новое.".format(name))
+
+
+def отписаться(conn: sqlite3.Connection, user_id: int, tail: str) -> str:
+    code = tail.strip().lower()
+    if code in ("все", "всё", "all"):
+        code = ""
+    if not store.unfollow_feed(conn, user_id, code):
+        return "Такой подписки нет: <code>/подписки</code> покажет ваши."
+    return "Подписка снята."
+
+
+def лента(conn: sqlite3.Connection, user_id: int, tail: str) -> str:
+    """Последние материалы издания прямо в ответ — предпросмотр перед подпиской."""
+    from . import sources  # noqa: PLC0415 — нужен только здесь
+
+    parts = tail.split()
+    code = parts[0].lower() if parts else ""
+    if not code or code not in sources.registry(conn):
+        return ("Нужно издание: <code>/лента meduza 5</code>. Возможны: {}".format(
+            ", ".join(sorted(sources.registry(conn))[:8])))
+    count = 5
+    if len(parts) > 1:
+        try:
+            count = max(1, min(int(parts[1]), 10))
+        except ValueError:
+            count = 5
+    rows = conn.execute(
+        "SELECT title, url FROM items WHERE source = ? AND cold = 0 "
+        "ORDER BY listed_at DESC LIMIT ?",
+        (code, count),
+    ).fetchall()
+    if not rows:
+        return "Материалов из этого издания в базе пока нет."
+    lines = ["Последние из {}:".format(sources.registry(conn)[code].label)]
+    lines.extend(
+        "— <a href=\"{url}\">{title}</a>".format(
+            url=row["url"], title=html.escape(row["title"] or "без заголовка")
+        )
+        for row in rows
+    )
+    return "\n".join(lines)
 
 
 def latency_text(conn: sqlite3.Connection) -> str:
@@ -210,6 +303,26 @@ def доступы(conn: sqlite3.Connection, user_id: int) -> str:
     )
 
 
+def источник(conn: sqlite3.Connection, user_id: int, tail: str) -> str:
+    """«/источник сайт» — найти ленту и подключить издание.
+
+    Просить может любой приглашённый: найденная лента входит в общий
+    каталог, но никому не приходит, пока человек не выбрал её сам
+    [CORE-016]. Выключить или убрать издание — по-прежнему только владелец.
+    """
+    import html  # noqa: PLC0415
+
+    from . import discover  # noqa: PLC0415 — импорт здесь разрывает круг
+
+    сайт = (tail or "").strip()
+    if not сайт:
+        return "Укажите сайт: <code>/источник example.com</code> — или адрес ленты целиком."
+    if not discover.попросить(сайт, user_id):
+        return "Очередь поиска переполнена — подождите пару минут и попробуйте снова."
+    # Ответ уходит с разметкой HTML: слово человека — данные, не разметка.
+    return "Ищу ленту на {} — о результате напишу сюда.".format(html.escape(сайт))
+
+
 def login_link(conn: sqlite3.Connection, user_id: int) -> str:
     """Одноразовая ссылка в веб. Пароля нет — значит нечему утечь."""
     from . import pages, web  # noqa: PLC0415 — импорт здесь разрывает круг
@@ -240,6 +353,16 @@ def answer(conn: sqlite3.Connection, user_id: int, name: str, text: str) -> str:
         return пригласить(conn, user_id, tail)
     if command in ("доступы", "access"):
         return доступы(conn, user_id)
+    if command in ("источник", "feed"):
+        return источник(conn, user_id, tail)
+    if command in ("подписаться", "follow"):
+        return подписаться(conn, user_id, tail)
+    if command in ("отписаться", "unfollow"):
+        return отписаться(conn, user_id, tail)
+    if command in ("подписки", "subs"):
+        return подписки(conn, user_id)
+    if command == "лента":
+        return лента(conn, user_id, tail)
     if command in ("добавить", "add"):
         return add_topic(conn, user_id, tail)
     if command in ("темы", "topics"):
@@ -262,8 +385,36 @@ async def press(bot: Any, session: Any, conn: sqlite3.Connection, budget: Any,
     «Часики» на кнопке гасятся сразу: телеграм ждёт ответа несколько секунд, а
     модель думает дольше. Растянуть один на другого — значит показать человеку
     ошибку там, где всё в порядке.
+
+    Кнопки меню (данные `m:…`) — отдельный путь: там модель не нужна,
+    перерисовкой экрана занимается модуль меню.
     """
     chat = (query.get("message") or {}).get("chat") or {}
+    data = str(query.get("data") or "")
+    if data.startswith("m:"):
+        from . import menu  # noqa: PLC0415 — импорт здесь разрывает круг
+
+        await bot.ack(str(query.get("id") or ""))
+        if chat.get("id"):
+            сообщение = query.get("message") or {}
+            try:
+                await menu.press(bot, conn, int(chat["id"]), int(chat["id"]),
+                                 int(сообщение.get("message_id") or 0), data)
+            except Exception as exc:  # noqa: BLE001 — кнопка не роняет бота
+                log.warning("кнопка меню «%s» сорвалась: %s", data, exc)
+        return True
+    if data.startswith("f:"):
+        # «в тему / не в тему»: отзыв без модели, поэтому ответ мгновенный.
+        parts = data.split(":")
+        ok = False
+        if chat.get("id") and len(parts) == 4:
+            try:
+                ok = store.topic_feedback_add(conn, int(parts[1]), int(parts[2]),
+                                              parts[3], int(chat["id"]))
+            except ValueError:
+                ok = False
+        await bot.ack(str(query.get("id") or ""), "Учтено" if ok else "Отзыв не записан")
+        return ok
     parsed = enrich.parse(str(query.get("data") or ""))
     if not chat.get("id") or parsed is None:
         await bot.ack(str(query.get("id") or ""))
@@ -282,6 +433,8 @@ async def press(bot: Any, session: Any, conn: sqlite3.Connection, budget: Any,
 async def serve(bot: Any, conn: sqlite3.Connection, stop: Any, rounds: int = 0,
                 session: Any = None, budget: Any = None) -> int:
     """Длинный опрос обновлений. Отдельная задача, сторожам не мешает."""
+    from . import menu  # noqa: PLC0415 — импорт здесь разрывает круг
+
     handled = 0
     budget = budget if budget is not None else model.Budget()
     pending: set[Any] = set()
@@ -300,13 +453,20 @@ async def serve(bot: Any, conn: sqlite3.Connection, stop: Any, rounds: int = 0,
             user = message.get("from") or {}
             if not chat.get("id"):
                 continue
-            reply = answer(
-                conn,
-                int(chat["id"]),
-                str(user.get("first_name") or ""),
-                str(message.get("text") or ""),
-            )
-            await bot.send(int(chat["id"]), reply, preview=False)
+            # Сначала меню: /меню и открытые диалоги забирают сообщение
+            # целиком, остальное уходит прежним командам.
+            экран = menu.сообщение(
+                conn, int(chat["id"]), str(message.get("text") or ""))
+            if экран is None:
+                reply, keyboard = answer(
+                    conn,
+                    int(chat["id"]),
+                    str(user.get("first_name") or ""),
+                    str(message.get("text") or ""),
+                ), None
+            else:
+                reply, keyboard = экран
+            await bot.send(int(chat["id"]), reply, preview=False, keyboard=keyboard)
             handled += 1
         rounds -= 1
         if rounds == 0:
@@ -318,4 +478,4 @@ async def serve(bot: Any, conn: sqlite3.Connection, stop: Any, rounds: int = 0,
 
 __all__ = ("HELP", "ЗАКРЫТО", "add_topic", "answer", "drop_topic", "ensure_user",
            "latency_text", "list_topics", "login_link", "press", "serve",
-           "доступы", "пригласить", "принять_ключ")
+           "доступы", "источник", "пригласить", "принять_ключ")

@@ -19,6 +19,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from . import scope
+
 DEFAULT_PATH = Path("data/fpnews.sqlite3")
 # Кэш страниц SQLite в килобайтах со знаком минус. 20 МБ — осознанный потолок:
 # на сервере свободно около 500 МБ, и база не имеет права их съесть.
@@ -201,6 +203,39 @@ SCHEMA = (
         UNIQUE(item_id, kind)                  -- второе нажатие бесплатно
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS feeds (
+        code        TEXT PRIMARY KEY,         -- из домена: example.com → example
+        label       TEXT NOT NULL,            -- название, как в самой ленте
+        door        TEXT NOT NULL,            -- адрес ленты
+        kind        TEXT NOT NULL DEFAULT 'rss',
+        interval    REAL NOT NULL DEFAULT 15.0, -- по замеру двери
+        conditional INTEGER NOT NULL DEFAULT 0, -- есть ли Last-Modified / ETag
+        host        TEXT NOT NULL DEFAULT '', -- для достройки относительных ссылок
+        notice      TEXT NOT NULL DEFAULT '', -- пометка, которую несёт материал
+        added_by    INTEGER,                  -- кто попросил
+        created_at  TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS feed_subs (
+        user_id    INTEGER NOT NULL,          -- кто хочет издание целиком
+        code       TEXT NOT NULL DEFAULT '',  -- код издания; пусто — все
+        created_at TEXT,                      -- ниже этой границы историю не играем
+        PRIMARY KEY (user_id, code)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS feed_subs_code ON feed_subs(code)",
+    """
+    CREATE TABLE IF NOT EXISTS topic_feedback (
+        topic_id   INTEGER NOT NULL,
+        item_id    INTEGER NOT NULL,
+        verdict    INTEGER NOT NULL,          -- 1 «в тему», 0 «не в тему»
+        user_id    INTEGER NOT NULL,
+        created_at TEXT,
+        PRIMARY KEY (topic_id, item_id)       -- один голос на материал в теме
+    )
+    """,
 )
 
 STAMPS = ("published_at", "listed_at", "fetched_at", "sent_at", "enriched_at")
@@ -246,6 +281,9 @@ LATE_COLUMNS = (
     # записан в работающей базе, роль проставляет `ensure` ниже: отбирать
     # доступ у своих при обновлении было бы сюрпризом.
     ("users", "role", "TEXT NOT NULL DEFAULT ''"),
+    # Шаг 16: темы стали профилями — стоп-слова и порог.
+    ("topics", "stopwords", "TEXT NOT NULL DEFAULT ''"),
+    ("topics", "threshold", "REAL NOT NULL DEFAULT 1"),
 )
 
 
@@ -564,12 +602,22 @@ def revive(conn: sqlite3.Connection, item_id: int) -> None:
     conn.commit()
 
 
-def gone(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, Any]]:
-    """Снятые с публикации, самые свежие первыми."""
+def gone(conn: sqlite3.Connection, limit: int = 50, *,
+         user_id: int = 0) -> list[dict[str, Any]]:
+    """Снятые с публикации, самые свежие первыми.
+
+    Чужих снятий читатель не видит: карточка снятия — это чужой материал,
+    если издание не выбрано человеком и ему не приходило [CORE-016].
+    """
+    хвост, параметры = scope.условие(conn, user_id)
+    where = "i.gone_at IS NOT NULL"
+    if хвост:
+        where = "{} AND {}".format(where, хвост)
     rows = conn.execute(
-        "SELECT id, url, source, title, published_at, listed_at, gone_at, gone_code "
-        "FROM items WHERE gone_at IS NOT NULL ORDER BY gone_at DESC LIMIT ?",
-        (int(limit),),
+        "SELECT i.id, i.url, i.source, i.title, i.published_at, i.listed_at, "
+        "i.gone_at, i.gone_code "
+        "FROM items i WHERE {} ORDER BY i.gone_at DESC LIMIT ?".format(where),
+        (*параметры, int(limit)),
     ).fetchall()
     return [dict(row) for row in rows]
 
@@ -641,7 +689,7 @@ def mark_query_seen(conn: sqlite3.Connection, query_id: int, last_item_id: int) 
 
 # Виды сообщений, которые можно выключить в интерфейсе. «Изменение» и
 # «запрос» намеренно в списке: человек вправе не хотеть досылок.
-KINDS = ("сырое", "дополнение", "изменение", "тоже_написали", "запрос")
+KINDS = ("сырое", "дополнение", "изменение", "тоже_написали", "запрос", "лента")
 
 
 def source_states(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
@@ -675,6 +723,79 @@ def source_every(conn: sqlite3.Connection, code: str) -> int:
     """Свой интервал издания в секундах. 0 — брать тот, что в коде."""
     row = conn.execute("SELECT every FROM source_state WHERE code = ?", (code,)).fetchone()
     return int(row["every"] or 0) if row is not None else 0
+
+
+# Ленты, добавленные на странице «Источники». Дверь и разбор — те же, что у
+# встроенных, но запись живёт в базе: править код ради каждого нового издания
+# значит требовать перезапуска всего проекта ради одной строки [NEWS-005].
+
+def feeds(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Добавленные ленты — для страницы и для проверки дублей."""
+    rows = conn.execute("SELECT code, label, door, interval, created_at "
+                        "FROM feeds ORDER BY created_at, code").fetchall()
+    return [dict(row) for row in rows]
+
+def feed_label(conn: sqlite3.Connection, code: str) -> str:
+    """Название добавленной ленты. Пусто — такой ленты нет."""
+    row = conn.execute("SELECT label FROM feeds WHERE code = ?",
+                       (str(code or ""),)).fetchone()
+    return str(row["label"] or "") if row is not None else ""
+
+def add_feed(conn: sqlite3.Connection, *, label: str, door: str, kind: str = "rss",
+             interval: float = 15.0, conditional: bool = False, host: str = "",
+             notice: str = "", added_by: int = 0) -> str:
+    """Записать добавленную ленту. Возвращает её код.
+
+    Код делается из домена: он нужен и в базе новостей, и в настройках
+    отдачи, и человеку в адресе страницы. Код встроенных источников не
+    занимается никогда: два источника с одним кодом — это одна выдача
+    напополам.
+    """
+    import re  # noqa: PLC0415
+
+    from . import sources  # noqa: PLC0415 — импорт здесь разрывает круг
+
+    домен = re.sub(r"[^a-z0-9]+", "",
+                   str(host or "").lower().removeprefix("www.").split(".")[0])
+    base = домен or "feed"
+    taken = set(sources.BY_CODE) | {str(row["code"]) for row in
+                                    conn.execute("SELECT code FROM feeds")}
+    code, номер = base, 1
+    while code in taken:
+        номер += 1
+        code = "{}-{}".format(base, номер)
+    conn.execute(
+        "INSERT INTO feeds(code, label, door, kind, interval, conditional, host, "
+        "notice, added_by, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (code, str(label or ""), str(door or ""), kind or "rss",
+         float(interval or 15.0), 1 if conditional else 0, str(host or ""),
+         str(notice or ""), int(added_by or 0) or None, now()),
+    )
+    conn.commit()
+    return code
+
+def drop_feed(conn: sqlite3.Connection, code: str) -> bool:
+    """Убрать добавленную ленту. Встроенный источник убрать нельзя."""
+    cursor = conn.execute("DELETE FROM feeds WHERE code = ?", (str(code or ""),))
+    if cursor.rowcount:
+        conn.execute("DELETE FROM source_state WHERE code = ?", (str(code or ""),))
+        conn.commit()
+    return cursor.rowcount > 0
+
+def custom_sources(conn: sqlite3.Connection) -> list[Any]:
+    """Добавленные ленты как Source: сторожа и страницы различия не видят."""
+    from . import sources  # noqa: PLC0415 — импорт здесь разрывает круг
+
+    out = []
+    for row in conn.execute("SELECT code, label, door, kind, interval, conditional, "
+                            "host, notice FROM feeds"):
+        out.append(sources.Source(
+            code=str(row["code"]), label=str(row["label"] or row["code"]),
+            door=str(row["door"]), kind=str(row["kind"] or "rss"),
+            interval=float(row["interval"] or 15.0),
+            conditional=bool(row["conditional"]), host=str(row["host"] or ""),
+            notice=str(row["notice"] or "")))
+    return out
 
 
 def kinds_of(conn: sqlite3.Connection, user_id: int) -> set[str]:
@@ -811,11 +932,218 @@ def set_topic_delivery(conn: sqlite3.Connection, topic_id: int, user_id: int, *,
     return cursor.rowcount > 0
 
 
+# --- Подписки на издания целиком ---
+
+def feed_subs_of(conn: sqlite3.Connection, user_id: int) -> list[dict[str, Any]]:
+    """На какие издания человек подписан целиком. Пустой код — все издания."""
+    rows = conn.execute(
+        "SELECT code, created_at FROM feed_subs WHERE user_id = ? ORDER BY code",
+        (int(user_id),),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def follow_feed(conn: sqlite3.Connection, user_id: int, code: Any) -> bool:
+    """Подписать на издание целиком. True — подписка новая, False — была.
+
+    Момент подписки становится нижней границей: что появилось в базе раньше,
+    подписчику не рассылается. Иначе при первом включении прилетал бы архив.
+    """
+    код = str(code or "").strip().lower()
+    if код in ("все", "всё", "all"):
+        код = ""
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO feed_subs(user_id, code, created_at) VALUES(?,?,?)",
+        (int(user_id), код, now()),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def unfollow_feed(conn: sqlite3.Connection, user_id: int, code: Any) -> bool:
+    код = str(code or "").strip().lower()
+    if код in ("все", "всё", "all"):
+        код = ""
+    cursor = conn.execute(
+        "DELETE FROM feed_subs WHERE user_id = ? AND code = ?",
+        (int(user_id), код),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def feed_subscribers(conn: sqlite3.Connection, source: Any) -> list[dict[str, Any]]:
+    """Подписчики издания: подписанные на него и на «все издания» сразу."""
+    rows = conn.execute(
+        "SELECT user_id, code, created_at FROM feed_subs WHERE code IN ('', ?)",
+        (str(source or "").strip().lower(),),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+# --- «Мои издания»: три состояния на каждое издание ---
+
+РЕЖИМЫ = ("всё", "тишина", "темы")
+
+
+def source_mode(conn: sqlite3.Connection, user_id: int, code: Any) -> str:
+    """Состояние издания для человека: «всё», «тишина» или «темы».
+
+    Три состояния — это два существующих механизма, увиденные вместе:
+    «всё» — подписка целиком (`feed_subs`), «тишина» — фильтр отдачи
+    (`users.sources`), «темы» — умолчание: материал приходит, только если
+    сработает тема или сторож. Состояние «тишина» видно лишь тогда, когда
+    фильтр непустой: пустой список в `users.sources` означает «можно всё».
+    """
+    код = str(code or "").strip().lower()
+    if any(row["code"] == код for row in feed_subs_of(conn, user_id)):
+        return "всё"
+    chosen = user_sources(conn, user_id)
+    if chosen and код not in chosen:
+        return "тишина"
+    return "темы"
+
+
+def set_source_mode(conn: sqlite3.Connection, user_id: int, code: Any,
+                    режим: Any, все: Any) -> bool:
+    """Установить состояние издания для человека. False — издания нет.
+
+    Полный список изданий приходит довеском, а не берётся из реестра: `store`
+    не должен знать о модуле источников, а «тишина» без полного списка не
+    вычислить — ей надо вычесть одно издание из всех. Новый источник в
+    каталоге при непустом фильтре молчит до ручного выбора: так человек
+    видит ровно то, что выбрал, и ничего сверх [CORE-016].
+    """
+    код = str(code or "").strip().lower()
+    полный = {str(c or "").strip().lower() for c in (все or []) if str(c or "").strip()}
+    if not код or код not in полный:
+        return False
+    какой = str(режим or "").strip().lower()
+    if какой not in РЕЖИМЫ:
+        return False
+    chosen = user_sources(conn, user_id)
+    if какой == "всё":
+        follow_feed(conn, user_id, код)
+        if chosen and код not in chosen:
+            set_user_sources(conn, user_id, chosen | {код})
+    elif какой == "тишина":
+        unfollow_feed(conn, user_id, код)
+        if chosen:
+            set_user_sources(conn, user_id, chosen - {код})
+        else:
+            set_user_sources(conn, user_id, полный - {код})
+    else:
+        unfollow_feed(conn, user_id, код)
+        if chosen and код not in chosen:
+            set_user_sources(conn, user_id, chosen | {код})
+    return True
+
+
+# --- Профили тем: слова, стоп-слова, порог ---
+
+def _topic_of(conn: sqlite3.Connection, topic_id: int, user_id: int) -> sqlite3.Row | None:
+    """Тема, если она принадлежит этому человеку. Чужую тему не отдаём."""
+    return conn.execute(
+        "SELECT * FROM topics WHERE id = ? AND user_id = ?", (int(topic_id), int(user_id))
+    ).fetchone()
+
+
+def _plain(word: str) -> str:
+    return str(word or "").strip().lower().replace("ё", "е")
+
+
+def topic_words_add(conn: sqlite3.Connection, topic_id: int, user_id: int,
+                    raw: Any) -> bool:
+    """Добавить слово в свою тему. Дубликат и мусор — False."""
+    слово = _plain(raw)
+    if not слово or " " in слово.replace(",", ""):
+        return False
+    row = _topic_of(conn, topic_id, user_id)
+    if row is None:
+        return False
+    have = [_plain(part) for part in str(row["words"] or "").split(",")]
+    stop = [_plain(part) for part in str(row["stopwords"] or "").split(",")]
+    if слово in have or слово in stop:
+        return False
+    было = str(row["words"] or "").strip().strip(",")
+    conn.execute("UPDATE topics SET words = ? WHERE id = ?",
+                 ((было + "," if было else "") + слово, int(topic_id)))
+    conn.commit()
+    return True
+
+
+def topic_stop_add(conn: sqlite3.Connection, topic_id: int, user_id: int,
+                   raw: Any) -> bool:
+    """Добавить стоп-слово в свою тему: совпавший кусок текста не считается."""
+    слово = _plain(raw)
+    if not слово:
+        return False
+    row = _topic_of(conn, topic_id, user_id)
+    if row is None:
+        return False
+    have = [_plain(part) for part in str(row["stopwords"] or "").split(",")]
+    if слово in have:
+        return False
+    было = str(row["stopwords"] or "").strip().strip(",")
+    conn.execute("UPDATE topics SET stopwords = ? WHERE id = ?",
+                 ((было + "," if было else "") + слово, int(topic_id)))
+    conn.commit()
+    return True
+
+
+def topic_threshold_set(conn: sqlite3.Connection, topic_id: int, user_id: int,
+                        value: Any) -> bool:
+    """Порог темы: сколько очков нужно материалу. Мусор — не меняется."""
+    try:
+        порог = float(str(value or "").strip().replace(",", "."))
+    except ValueError:
+        return False
+    if порог < 0 or порог > 100:
+        return False
+    if _topic_of(conn, topic_id, user_id) is None:
+        return False
+    conn.execute("UPDATE topics SET threshold = ? WHERE id = ?", (порог, int(topic_id)))
+    conn.commit()
+    return True
+
+
+def topic_feedback_add(conn: sqlite3.Connection, topic_id: int, item_id: int,
+                       verdict: Any, user_id: int) -> bool:
+    """Кнопка «в тему»/«не в тему» под сообщением. Считает только владелец темы."""
+    row = conn.execute("SELECT user_id FROM topics WHERE id = ?", (int(topic_id),)).fetchone()
+    if row is None or int(row["user_id"]) != int(user_id):
+        return False
+    conn.execute(
+        "INSERT OR REPLACE INTO topic_feedback(topic_id, item_id, verdict, user_id, created_at) "
+        "VALUES(?,?,?,?,?)",
+        (int(topic_id), int(item_id), 1 if str(verdict) in ("1", "True", "true") else 0,
+         int(user_id), now()),
+    )
+    conn.commit()
+    return True
+
+
+def feedback_texts(conn: sqlite3.Connection, topic_id: int, verdict: int = 1,
+                   limit: int = 50) -> list[str]:
+    """Заголовки и лиды материалов, отмеченных кнопкой. Пусто — не отмечали."""
+    rows = conn.execute(
+        "SELECT i.title, i.lead FROM topic_feedback f JOIN items i ON i.id = f.item_id "
+        "WHERE f.topic_id = ? AND f.verdict = ? ORDER BY f.created_at DESC LIMIT ?",
+        (int(topic_id), 1 if verdict else 0, int(limit)),
+    ).fetchall()
+    return ["{}. {}".format(row["title"], row["lead"]) for row in rows]
+
+
 def entities_top(conn: sqlite3.Connection, *, kind: str = "", query: str = "",
-                 days: int = 30, limit: int = 100) -> list[dict[str, Any]]:
+                 days: int = 30, limit: int = 100,
+                 user_id: int = 0) -> list[dict[str, Any]]:
     """Кого чаще всего упоминают за окно. Пустой список — мы не видели."""
     where = ["m.item_id = i.id"]
     params: list[Any] = []
+    хвост, параметры = scope.условие(conn, user_id)
+    if хвост:
+        where.append(хвост)
+        params.extend(параметры)
     if kind:
         where.append("e.kind = ?")
         params.append(kind)
@@ -843,31 +1171,38 @@ def entity(conn: sqlite3.Connection, entity_id: int) -> dict[str, Any] | None:
 
 
 def entity_items(conn: sqlite3.Connection, entity_id: int,
-                 limit: int = 50) -> list[dict[str, Any]]:
+                 limit: int = 50, *, user_id: int = 0) -> list[dict[str, Any]]:
     """Материалы, где сущность встретилась. Свежие сверху, со ссылкой."""
+    хвост, параметры = scope.условие(conn, user_id)
+    чужие = (" AND " + хвост) if хвост else ""
     rows = conn.execute(
         "SELECT i.id, i.title, i.url, i.source, i.published_at, i.listed_at, i.gone_at, "
         "m.in_title, m.times FROM mentions m JOIN items i ON i.id = m.item_id "
-        "WHERE m.entity_id = ? ORDER BY COALESCE(i.published_at, i.listed_at) DESC LIMIT ?",
-        (int(entity_id), max(1, min(int(limit), 200))),
+        "WHERE m.entity_id = ?" + чужие +
+        " ORDER BY COALESCE(i.published_at, i.listed_at) DESC LIMIT ?",
+        (int(entity_id), *параметры, max(1, min(int(limit), 200))),
     ).fetchall()
     return [dict(row) for row in rows]
 
 
-def entity_days(conn: sqlite3.Connection, entity_id: int, days: int = 30) -> list[dict[str, Any]]:
+def entity_days(conn: sqlite3.Connection, entity_id: int, days: int = 30, *,
+                user_id: int = 0) -> list[dict[str, Any]]:
     """Упоминания по дням — для полоски всплеска на карточке."""
+    хвост, параметры = scope.условие(conn, user_id)
+    чужие = (" AND " + хвост) if хвост else ""
     rows = conn.execute(
         "SELECT date(COALESCE(i.published_at, i.listed_at)) AS день, COUNT(*) AS сколько "
         "FROM mentions m JOIN items i ON i.id = m.item_id WHERE m.entity_id = ? "
-        "AND julianday(COALESCE(i.published_at, i.listed_at)) >= julianday('now', ?) "
+        "AND julianday(COALESCE(i.published_at, i.listed_at)) >= julianday('now', ?)"
+        + чужие + " "
         "GROUP BY день ORDER BY день",
-        (int(entity_id), "-{} days".format(int(days))),
+        (int(entity_id), "-{} days".format(int(days)), *параметры),
     ).fetchall()
     return [dict(row) for row in rows]
 
 
 def bursts(conn: sqlite3.Connection, *, window: int = 1, background: int = 28,
-           limit: int = 30, порог: float = 3.0) -> list[dict[str, Any]]:
+           limit: int = 30, порог: float = 3.0, user_id: int = 0) -> list[dict[str, Any]]:
     """Всплески: о ком стали писать заметно чаще своей же нормы.
 
     Норма считается медианой дневных упоминаний за четыре недели, а разброс —
@@ -894,6 +1229,8 @@ def bursts(conn: sqlite3.Connection, *, window: int = 1, background: int = 28,
 
     окно = max(1, int(window))
     фон_дней = max(окно + 1, int(background))
+    хвост, параметры = scope.условие(conn, user_id)
+    чужие = (" AND " + хвост) if хвост else ""
     строки = conn.execute(
         "SELECT e.id, e.kind, e.name, "
         "date(COALESCE(i.published_at, i.listed_at)) AS день, "
@@ -902,9 +1239,10 @@ def bursts(conn: sqlite3.Connection, *, window: int = 1, background: int = 28,
         ">= julianday('now', ?) THEN 1 ELSE 0 END) AS свежий "
         "FROM entities e JOIN mentions m ON m.entity_id = e.id "
         "JOIN items i ON i.id = m.item_id "
-        "WHERE julianday(COALESCE(i.published_at, i.listed_at)) >= julianday('now', ?) "
+        "WHERE julianday(COALESCE(i.published_at, i.listed_at)) >= julianday('now', ?)"
+        + чужие + " "
         "GROUP BY e.id, день",
-        ("-{} days".format(окно), "-{} days".format(фон_дней)),
+        ("-{} days".format(окно), "-{} days".format(фон_дней), *параметры),
     ).fetchall()
     собрано: dict[int, dict[str, Any]] = {}
     for строка in строки:
@@ -1176,9 +1514,12 @@ __all__ = ("CACHE_KB", "DEFAULT_PATH", "KINDS", "LATE_COLUMNS", "SCHEMA", "STAMP
            "revise", "revisions", "revive", "save_enrichment", "save_snapshot", "save_vector",
            "set_fingerprint", "set_kinds", "set_quiet", "set_source", "snapshot_page", "snapshots",
            "source_enabled", "source_every", "source_states", "kinds_of", "stamp",
-           "set_topic_delivery", "set_user_sources", "source_allowed", "topics_of",
+           "set_source_mode", "set_topic_delivery", "set_user_sources",
+           "source_allowed", "source_mode", "topics_of",
            "toggle_notify", "user_sources", "vector_of", "bursts", "entities_top", "entity",
            "entity_days", "entity_items", "mark_digest", "set_digest", "sizes",
            "source_health", "summary", "index_size", "memory_mb", "delay_of", "set_delay",
            "target_of", "set_target", "archive_span", "drop_old_snapshots", "compact",
-           "measurements")
+           "measurements", "feed_subs_of", "follow_feed", "unfollow_feed", "feed_subscribers",
+           "topic_words_add", "topic_stop_add", "topic_threshold_set", "topic_feedback_add",
+           "feedback_texts")

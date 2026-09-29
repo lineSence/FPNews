@@ -20,8 +20,8 @@ from typing import Any
 
 import diag
 
-from . import (article, bridge, dedup, deliver, digest, entities, fetch, hold, model,
-               queries, recheck, sources, store, story, telegram, web)
+from . import (article, bridge, dedup, deliver, digest, discover, entities, fetch, hold,
+ model, queries, recheck, sources, store, story, telegram, web)
 
 log = logging.getLogger("fpnews")
 
@@ -137,14 +137,26 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
         bot = telegram.Bot(session)
         if not bot.ready:
             log.warning("TELEGRAM_BOT_TOKEN не задан: новости будут копиться в базе без рассылки")
+        else:
+            # Короткий список команд в системном меню телеграма: всё остальное
+            # делается кнопками из /меню.
+            await bot.set_commands()
+        # Встроенные источники описаны в коде, добавленные — в базе: и те и
+        # другие равноправны, и сторожа не должны их различать [NEWS-005].
+        известные = sources.registry(conn)
+        deliver.LABEL.update({code: источник.label for code, источник in
+                              известные.items() if code not in sources.BY_CODE})
+        if not codes:
+            codes = sorted(известные)
         # Выключенные в интерфейсе издания не опрашиваются вовсе: это
         # настройка, а не фильтр выдачи.
-        живые = [code for code in codes if store.source_enabled(conn, code)]
+        живые = [code for code in codes
+                 if code in известные and store.source_enabled(conn, code)]
         if len(живые) != len(codes):
             log.info("выключено в интерфейсе: %s", ", ".join(sorted(set(codes) - set(живые))))
         watchers = [
             asyncio.create_task(
-                watch.loop(session, sources.BY_CODE[code], conn, stop, queue, rounds),
+                watch.loop(session, известные[code], conn, stop, queue, rounds),
                 name="сторож-{}".format(code),
             )
             for code in живые
@@ -172,6 +184,10 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
         # ходит этот контур [NEWS-002].
         связной = asyncio.create_task(bridge.loop(bot, conn, stop), name="проверка-связи")
         терпеливый = asyncio.create_task(hold.loop(bot, conn, stop), name="отложенная-отдача")
+        # Поиск и подключение лент из веба и бота: страницы только просят,
+        # в сеть ходит этот контур [NEWS-002].
+        искатель = asyncio.create_task(
+            discover.loop(bot, session, conn, stop, queue), name="поиск-лент")
         try:
             await asyncio.gather(*watchers)
         except asyncio.CancelledError:  # pragma: no cover — снаружи
@@ -184,6 +200,7 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
         digests = await digester
         проверок = await связной
         отложенных = await терпеливый
+        подключено = await искатель
         site.cancel()
         if talker is not None:
             stop.set()
@@ -195,6 +212,7 @@ async def serve(codes: list[str], rounds: int, path: str) -> dict[str, Any]:
     summary["сводок"] = digests
     summary["проверок_связи"] = проверок
     summary["отложенных_отдач"] = отложенных
+    summary["поисков_лент"] = подключено
     summary["вызовов_модели"] = budget.calls
     if budget.embeds:
         summary["векторов"] = budget.embeds
@@ -223,8 +241,13 @@ def main(argv: Any = None) -> int:
         conn.close()
         return 0
 
-    codes = args.source or [source.code for source in sources.ALL]
-    unknown = [code for code in codes if code not in sources.BY_CODE]
+    # «Не знаю такого» обязано быть правдой и для добавленных в интерфейсе
+    # лент: их коды в базе, а не в коде программы.
+    знакомство = store.connect(args.db)
+    известные = sources.registry(знакомство)
+    знакомство.close()
+    codes = args.source or sorted(известные)
+    unknown = [code for code in codes if code not in известные]
     if unknown:
         print("не знаю источников: {}".format(", ".join(unknown)))
         return 1

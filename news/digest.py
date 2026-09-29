@@ -53,16 +53,23 @@ def collect(conn: Any, user_id: int, hours: int = DEFAULT_HOURS) -> dict[str, An
         "julianday(d.sent_at) >= julianday('now', ?) AND d.kind IN ('сырое', 'запрос') ORDER BY d.id DESC LIMIT ?",
         (int(user_id), окно, LINES),
     ).fetchall()
+    # Сводка описывает окно с точки зрения одного человека, поэтому правки,
+    # снятия и всплески тоже проходят через его область видимости: чужие
+    # материалы в «вашей» сводке — это не сводка, а подглядывание [CORE-016].
+    from . import scope  # noqa: PLC0415 — нужен только здесь
+
+    хвост, параметры = scope.условие(conn, user_id)
+    чужие = (" AND " + хвост) if хвост else ""
     правки = conn.execute(
         "SELECT i.id, i.title, r.seen_at FROM item_revisions r JOIN items i ON i.id = r.item_id "
-        "WHERE julianday(r.seen_at) >= julianday('now', ?) GROUP BY i.id "
+        "WHERE julianday(r.seen_at) >= julianday('now', ?)" + чужие + " GROUP BY i.id "
         "ORDER BY r.seen_at DESC LIMIT ?",
-        (окно, LINES),
+        (окно, *параметры, LINES),
     ).fetchall()
     снятия = conn.execute(
-        "SELECT id, title, gone_code FROM items WHERE gone_at IS NOT NULL "
-        "AND julianday(gone_at) >= julianday('now', ?) "
-        "ORDER BY gone_at DESC LIMIT ?", (окно, LINES),
+        "SELECT i.id, i.title, i.gone_code FROM items i WHERE i.gone_at IS NOT NULL "
+        "AND julianday(i.gone_at) >= julianday('now', ?)" + чужие + " "
+        "ORDER BY i.gone_at DESC LIMIT ?", (окно, *параметры, LINES),
     ).fetchall()
     return {
         "часов": int(hours),
@@ -70,7 +77,7 @@ def collect(conn: Any, user_id: int, hours: int = DEFAULT_HOURS) -> dict[str, An
         "ваше": [dict(row) for row in свои],
         "правки": [dict(row) for row in правки],
         "снятия": [dict(row) for row in снятия],
-        "всплески": [row for row in store.bursts(conn, window=1, limit=LINES)
+        "всплески": [row for row in store.bursts(conn, window=1, limit=LINES, user_id=user_id)
                      if not row["новое"] or row["сейчас"] >= 2][:LINES],
     }
 

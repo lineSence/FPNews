@@ -9,16 +9,10 @@ JavaScript. `aiohttp` или `starlette` с `uvicorn` — это 30–60 МБ п
 Здесь `asyncio.start_server`, разбор запроса руками и ответ строкой. Это
 примерно двести строк, которые полностью понятны и ничего не тянут.
 
-Про безопасность. Сервер слушает `127.0.0.1` и наружу не смотрит: снаружи
-будет Caddy с сертификатом, а он же добавит HTTPS и ограничение частоты. До
-этого момента интерфейс доступен только на самой машине или через
-`ssh -N -L 6769:127.0.0.1:6769`.
-
-Вход — одноразовый код из бота, а не Telegram Login Widget. Причина простая:
-виджету нужен публичный домен, привязанный к боту, а проверять интерфейс надо
-на `localhost` до всякого домена. Код живёт пять минут, сгорает при первом
-использовании и не даёт ничего, кроме сессии того же человека, который его
-запросил.
+Про безопасность. Сервер слушает `127.0.0.1`: снаружи будет Caddy с
+сертификатом. Вход — одноразовый код из бота на пять минут, он сгорает при
+первом использовании. Решения «кому что можно», защитные заголовки и уборка
+просроченных сессий живут в `news/guard.py` — здесь только маршруты.
 """
 
 from __future__ import annotations
@@ -31,7 +25,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import bridge, pages, store
+from . import bridge, discover, guard, pages, store
 
 log = logging.getLogger("fpnews.web")
 
@@ -111,14 +105,15 @@ class Response:
             "HTTP/1.1 {}".format(self.status),
             "Content-Type: {}".format(self.kind),
             "Content-Length: {}".format(len(data)),
-            "X-Content-Type-Options: nosniff",
-            "Referrer-Policy: same-origin",
             "Connection: close",
         ]
+        head += guard.заголовки()
+        # Значения, собранные из запроса, проходят через `guard.чисто`:
+        # перевод строки внутри `Location` разрезал бы ответ [CORE-016].
         if self.location:
-            head.append("Location: {}".format(self.location))
+            head.append("Location: {}".format(guard.чисто(self.location)))
         if self.cookie:
-            head.append("Set-Cookie: {}".format(self.cookie))
+            head.append("Set-Cookie: {}".format(guard.чисто(self.cookie)))
         if self.filename:
             # Имя в кавычках и в UTF-8: без этого браузер сохранит «лента»
             # набором вопросительных знаков.
@@ -209,7 +204,7 @@ def redeem(conn: Any, code: str) -> int:
 
 
 def cookie_value(token: str) -> str:
-    secure = "; Secure" if (os.getenv("FPNEWS_WEB_SECURE") or "") == "1" else ""
+    secure = "; Secure" if guard.за_проксёй() else ""
     return "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}".format(
         COOKIE, token, SESSION_DAYS * 86400, secure
     )
@@ -235,7 +230,7 @@ def safe_back(where: str) -> str:
     чужим адресом, и открытый редирект из настройки оформления — подарок для
     поддельной страницы входа [CORE-016].
     """
-    where = where or "/"
+    where = guard.чисто(where) or "/"
     if not where.startswith("/") or where.startswith("//") or "\\" in where:
         return "/"
     return where
@@ -250,7 +245,8 @@ def csrf(token: str) -> str:
 
 # Разделы, куда возвращаемся после формы: список закрыт, чтобы адрес из
 # формы не превратился в редирект куда попало.
-_SECTIONS = ("/запросы", "/источники", "/сводка", "/телеграм", "/темы", "/хранение")
+_SECTIONS = ("/доступы", "/запросы", "/источники", "/сводка", "/телеграм", "/темы",
+             "/подписки", "/хранение")
 
 
 def _number(raw: Any) -> int:
@@ -263,18 +259,39 @@ def _number(raw: Any) -> int:
 
 def route(conn: Any, request: Request) -> Response:
     """Вся маршрутизация. Чистая функция — поэтому и проверяется тестами."""
+    from . import access  # noqa: PLC0415 — нужен только здесь
     from . import bot as bot_module  # noqa: PLC0415 — импорт здесь разрывает круг
 
     token = request.cookies.get(COOKIE) or ""
     user_id = whoami(conn, request)
     theme = theme_of(request)
     if request.path == "/вход":
+        # Код гасим всегда, даже когда попыток уже слишком много: иначе
+        # чужой перебор закрывал бы вход и настоящему человеку [CORE-017].
         entering = redeem(conn, request.query.get("код", ""))
-        if not entering:
-            return Response(pages.login(theme), status="401 Unauthorized")
-        return redirect("/", cookie_value(new_session(conn, entering)))
+        if entering:
+            guard.забыть_входы()
+            guard.убрать_просроченное(conn)
+            return redirect("/", cookie_value(new_session(conn, entering)))
+        сколько = guard.неудачный_вход()
+        if сколько >= guard.ПОПЫТОК_ВХОДА:
+            log.warning("неудачных входов в окне: %s", сколько)
+            return Response(pages.oops(
+                "Слишком много попыток входа. Попросите у бота свежий код "
+                "и попробуйте через несколько минут.", theme),
+                status="429 Too Many Requests")
+        return Response(pages.login(theme), status="401 Unauthorized")
     if not user_id:
         return Response(pages.login(theme), status="401 Unauthorized")
+    if guard.отозван(conn, user_id):
+        # Приглашение отозвали, а кука в браузере осталась. Гасим сессию,
+        # а не просто отказываем: иначе она проживёт свои тридцать дней.
+        conn.execute("DELETE FROM sessions WHERE user_id = ?", (int(user_id),))
+        conn.commit()
+        return Response(pages.login(theme), status="401 Unauthorized")
+    хозяин = access.владелец(conn, user_id)
+    if not guard.пускать(conn, user_id, request.path, request.method):
+        return Response(pages.oops(guard.ОТКАЗ, theme), status="403 Forbidden")
     if request.method == "POST":
         if request.form.get("метка") != csrf(token):
             # Причина почти всегда одна: страницу открыли до входа или сессия
@@ -287,9 +304,33 @@ def route(conn: Any, request: Request) -> Response:
                 "Обновите страницу и повторите.", theme), status="400 Bad Request")
         section = "/" + request.path.strip("/").split("/")[0]
         if request.path == "/темы/добавить":
-            bot_module.add_topic(conn, user_id, request.form.get("слова", ""))
+            bot_module.add_topic(conn, user_id, request.form.get("слова", ""),
+                                 stop=request.form.get("стоп", ""),
+                                 threshold=request.form.get("порог", ""))
         elif request.path == "/темы/удалить":
             bot_module.drop_topic(conn, user_id, request.form.get("номер", ""))
+        elif request.path == "/темы/стоп":
+            store.topic_stop_add(conn, _number(request.form.get("номер")), user_id,
+                                 request.form.get("стоп", ""))
+        elif request.path == "/темы/порог":
+            store.topic_threshold_set(conn, _number(request.form.get("номер")), user_id,
+                                       request.form.get("порог", ""))
+        elif request.path == "/темы/слово":
+            store.topic_words_add(conn, _number(request.form.get("номер")), user_id,
+                                  request.form.get("слово", ""))
+        elif request.path == "/подписки/добавить":
+            store.follow_feed(conn, user_id, request.form.get("код", ""))
+        elif request.path == "/подписки/убрать":
+            store.unfollow_feed(conn, user_id, request.form.get("код", ""))
+        elif request.path == "/подписки/режим":
+            # Три состояния издания. Полный список нужен «тишине»: без него
+            # не из чего вычитать одно издание. Реестр здесь, а не в store —
+            # чтобы база не знала об источниках.
+            from . import sources  # noqa: PLC0415
+
+            store.set_source_mode(conn, user_id, request.form.get("код", ""),
+                                  request.form.get("режим", ""),
+                                  sources.registry(conn))
         elif request.path == "/выход":
             conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
             conn.commit()
@@ -318,10 +359,38 @@ def route(conn: Any, request: Request) -> Response:
             bridge.проверить(user_id)
         elif request.path == "/источники/переключить":
             code = request.form.get("код", "")
+            if (not request.form.get("точно")
+                    and store.source_enabled(conn, code)
+                    and store.feed_subscribers(conn, code)):
+                люди = store.feed_subscribers(conn, code)
+                return Response(pages.confirm_page(
+                    "Это издание получают {} чел.".format(len(люди)) +
+                    ". Выключить его можно, но их выбор — тоже факт, и прятать "
+                    "его от вас мы не будем.",
+                    "/источники/переключить", csrf(token), {"код": code},
+                    "Всё равно выключить", theme))
             store.set_source(conn, code, enabled=not store.source_enabled(conn, code))
         elif request.path == "/источники/интервал":
             store.set_source(conn, request.form.get("код", ""),
                              every=_number(request.form.get("секунд")))
+        elif request.path == "/источники/добавить":
+            # Поиск ленты ходит в сеть по чужим адресам и занимает секунды:
+            # страница отвечает сразу, а ходит отдельный контур [NEWS-002].
+            discover.попросить((request.form.get("сайт", "") or "").strip(), user_id)
+        elif request.path == "/источники/удалить":
+            code = (request.form.get("код", "") or "").strip()
+            if (not request.form.get("точно") and store.feed_subscribers(conn, code)):
+                люди = store.feed_subscribers(conn, code)
+                return Response(pages.confirm_page(
+                    "На этом издании {} чел.".format(len(люди)) +
+                    ". Удаление отключает его для всех: записи в архиве останутся, "
+                    "но новое приходить перестанет.",
+                    "/источники/удалить", csrf(token), {"код": code},
+                    "Всё равно удалить", theme))
+            if store.drop_feed(conn, code):
+                # Сторожа убранной ленты останавливаем сразу: без этого он
+                # продолжал бы опрашивать дверь до перезапуска службы.
+                discover.погасить(code)
         elif request.path == "/телеграм/сохранить":
             store.set_kinds(conn, user_id, request.all_of("вид"))
             store.set_quiet(conn, user_id, request.form.get("с", ""), request.form.get("по", ""))
@@ -331,6 +400,15 @@ def route(conn: Any, request: Request) -> Response:
             store.set_digest(conn, user_id, request.form.get("время", ""))
         elif request.path == "/телеграм/издания":
             store.set_user_sources(conn, user_id, request.all_of("издание"))
+        elif request.path == "/доступы/выдать":
+            ключ, номер = access.выдать(
+                conn, request.form.get("кому", ""),
+                роль=(request.form.get("роль", "") or access.ЧИТАТЕЛЬ))
+            # Единственный ответ формы, который не перенаправление: ключ
+            # существует только в этом ответе, в базе лежит лишь отпечаток.
+            return Response(pages.invite_page(номер, ключ, theme))
+        elif request.path == "/доступы/отозвать":
+            access.отозвать(conn, request.form.get("номер", ""))
         elif request.path == "/телеграм/тема":
             store.set_topic_delivery(conn, _number(request.form.get("номер")), user_id,
                                      enabled=bool(request.form.get("отдавать")),
@@ -343,9 +421,13 @@ def route(conn: Any, request: Request) -> Response:
         chosen = want if want in pages.THEMES else "система"
         return redirect(safe_back(request.query.get("откуда", "/")), theme_cookie(chosen))
     if request.path == "/":
-        return Response(pages.home(conn, user_id, csrf(token), theme))
+        return Response(pages.home(conn, user_id, csrf(token), theme, хозяин))
+    if request.path == "/доступы":
+        return Response(pages.access_page(conn, csrf(token), theme))
     if request.path == "/темы":
         return Response(pages.topics_page(conn, user_id, csrf(token), theme))
+    if request.path == "/подписки":
+        return Response(pages.subs_page(conn, user_id, csrf(token), theme))
     if request.path == "/задержки":
         return Response(pages.latency(conn, theme))
     if request.path == "/лента":
@@ -354,15 +436,16 @@ def route(conn: Any, request: Request) -> Response:
     if request.path == "/новости":
         return Response(pages.feed(conn, user_id, theme=theme))
     if request.path == "/поиск":
-        return Response(pages.search_page(conn, request.query, theme))
+        return Response(pages.search_page(conn, request.query, theme, user_id))
     if request.path == "/выгрузка":
         from . import export  # noqa: PLC0415 — нужен только здесь
 
         вид = request.query.get("формат", "csv")
-        тело, тип, имя = export.make(conn, request.query, вид, request.all_asked)
+        тело, тип, имя = export.make(conn, request.query, вид, request.all_asked,
+                                     user_id)
         return Response(тело, kind=тип, filename=имя)
     if request.path == "/хранение":
-        return Response(pages.storage_page(conn, csrf(token), theme))
+        return Response(pages.storage_page(conn, csrf(token), theme, хозяин))
     if request.path == "/диагностика":
         return Response(pages.diagnostics_page(theme))
     if request.path == "/замеры":
@@ -370,7 +453,7 @@ def route(conn: Any, request: Request) -> Response:
     if request.path == "/досье":
         from . import export  # noqa: PLC0415 — нужен только здесь
 
-        тело, имя = export.dossier(conn, request.query, request.all_asked)
+        тело, имя = export.dossier(conn, request.query, request.all_asked, user_id)
         if not тело:
             return Response(pages.oops("Не из чего собрать досье: нет ни сущности, "
                                        "ни слов запроса.", theme), status="404 Not Found")
@@ -380,24 +463,24 @@ def route(conn: Any, request: Request) -> Response:
     if request.path == "/сводка":
         return Response(pages.digest_page(conn, user_id, csrf(token), theme))
     if request.path == "/сущности":
-        return Response(pages.entities_page(conn, request.query, theme))
+        return Response(pages.entities_page(conn, request.query, theme, user_id))
     if request.path == "/всплески":
-        return Response(pages.bursts_page(conn, theme))
+        return Response(pages.bursts_page(conn, theme, user_id))
     if request.path == "/сущность":
-        карточка = pages.entity_page(conn, request.query.get("id", ""), theme)
+        карточка = pages.entity_page(conn, request.query.get("id", ""), theme, user_id)
         if карточка is None:
             return Response(pages.oops("Такой сущности нет.", theme), status="404 Not Found")
         return Response(карточка)
     if request.path == "/правки":
-        return Response(pages.changes_page(conn, theme))
+        return Response(pages.changes_page(conn, theme, user_id=user_id))
     if request.path == "/источники":
-        return Response(pages.sources_page(conn, csrf(token), theme))
+        return Response(pages.sources_page(conn, csrf(token), theme, хозяин, user_id))
     if request.path == "/телеграм":
         return Response(pages.telegram_page(conn, user_id, csrf(token), theme))
     if request.path == "/запросы":
         return Response(pages.queries_page(conn, user_id, csrf(token), theme))
     if request.path == "/копия":
-        saved = pages.copy_page(conn, request.query.get("id", ""))
+        saved = pages.copy_page(conn, request.query.get("id", ""), user_id)
         if saved is None:
             return Response(pages.oops("Такой копии нет.", theme), status="404 Not Found")
         # Отдаём текстом, а не разметкой. Это чужой HTML со скриптами и
@@ -405,12 +488,12 @@ def route(conn: Any, request: Request) -> Response:
         # источник и отдать ему куку сессии [CORE-016].
         return Response(saved, kind="text/plain; charset=utf-8")
     if request.path == "/материал":
-        card = pages.item_page(conn, request.query.get("id", ""), theme)
+        card = pages.item_page(conn, request.query.get("id", ""), theme, user_id)
         if card is None:
             return Response(pages.oops("Такого материала нет.", theme), status="404 Not Found")
         return Response(card)
     if request.path == "/сюжет":
-        plot = pages.story_page(conn, request.query.get("id", ""), theme)
+        plot = pages.story_page(conn, request.query.get("id", ""), theme, user_id)
         if plot is None:
             return Response(pages.oops("Сюжета нет: других изданий мы не видели.", theme),
                             status="404 Not Found")

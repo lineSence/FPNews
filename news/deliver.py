@@ -59,6 +59,67 @@ def message(item: dict[str, Any], hit: topics.Hit) -> str:
     )
 
 
+def feed_message(item: dict[str, Any]) -> str:
+    """Материал по подписке на издание целиком: без темы, просто всё."""
+    source = LABEL.get(str(item.get("source")), str(item.get("source")))
+    mark = NOTICE.get(str(item.get("source")))
+    return (
+        "<b>{title}</b>\n"
+        "{source}{mark} · издание целиком\n"
+        "{url}"
+    ).format(
+        title=html.escape(str(item.get("title") or "без заголовка")),
+        source=source,
+        mark=" ({})".format(mark) if mark else "",
+        url=item.get("url"),
+    )
+
+
+def keyboard(item_id: int, topic_id: int | None = None) -> dict[str, Any]:
+    """Кнопки под сообщением: модель — всем, «в тему / не в тему» — темам.
+
+    Отзыв под материалом видит только владелец темы, и нажатие учитывается
+    тоже только у него — чужие отзывы о чужой теме не собираем.
+    """
+    rows = enrich.keyboard(item_id)["inline_keyboard"]
+    if topic_id:
+        rows.append([
+            {"text": "в тему", "callback_data": "f:{}:{}:1".format(topic_id, item_id)},
+            {"text": "не в тему", "callback_data": "f:{}:{}:0".format(topic_id, item_id)},
+        ])
+    return {"inline_keyboard": rows}
+
+
+def получил(conn: sqlite3.Connection, item_id: int, user_id: int) -> bool:
+    """Уже ушло ли этому человеку основным видом: темой или подпиской.
+
+    Вид один — сообщение одно. Иначе человек с темой по тому же изданию
+    получал бы каждый материал дважды.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM deliveries WHERE item_id = ? AND user_id = ? "
+        "AND kind IN ('сырое', 'лента')",
+        (int(item_id), int(user_id)),
+    ).fetchone()
+    return row is not None
+
+
+def появился_после(conn: sqlite3.Connection, item_id: int, since: Any) -> bool:
+    """Появился ли материал в базе позже момента.
+
+    Подписка не проигрывает историю [NEWS-004]: что мы увидели раньше подписки,
+    подписчику не уходит. Момента появления нет — считаем материал старым:
+    молча прислать архив — хуже, чем промолчать.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM items WHERE id = ? "
+        "AND COALESCE(listed_at, '') != '' "
+        "AND julianday(listed_at) >= julianday(?)",
+        (int(item_id), str(since or "")),
+    ).fetchone()
+    return row is not None
+
+
 def also_message(item: dict[str, Any], original: dict[str, Any]) -> str:
     """Второе сообщение по тому же событию: коротко и со ссылкой."""
     source = LABEL.get(str(item.get("source")), str(item.get("source")))
@@ -107,6 +168,18 @@ async def send_also(bot: Any, conn: sqlite3.Connection, item_id: int, original_i
                               preview=False, keyboard=enrich.keyboard(item_id)):
             continue
         record(conn, item_id, hit.user_id, hit.topic_id, "тоже_написали")
+        sent += 1
+    for line in store.feed_subscribers(conn, item.get("source")):
+        user_id = int(line["user_id"])
+        if user_id not in got:
+            continue  # обычную отправку сделает send_item
+        if already(conn, item_id, user_id, "тоже_написали") or not wants(
+                conn, user_id, "тоже_написали"):
+            continue
+        if not await bot.send(store.target_of(conn, user_id), also_message(item, original),
+                              preview=False, keyboard=enrich.keyboard(item_id)):
+            continue
+        record(conn, item_id, user_id, None, "тоже_написали")
         sent += 1
     return sent
 
@@ -206,11 +279,12 @@ async def send_item(bot: Any, conn: sqlite3.Connection, item_id: int) -> int:
                        str(item.get("source") or ""))
     knew = _already_knows(conn, item.get("dup_of"))
     sent = 0
+    got: set[int] = set()
     for hit in hits:
         if hit.user_id in knew:
             # Ему уже приходил оригинал: перепечатка уйдёт как «тоже написали».
             continue
-        if already(conn, item_id, hit.user_id, "сырое") or not wants(conn, hit.user_id, "сырое"):
+        if получил(conn, item_id, hit.user_id) or not wants(conn, hit.user_id, "сырое"):
             continue
         if not allowed(conn, hit.user_id, item.get("source")):
             continue
@@ -218,13 +292,30 @@ async def send_item(bot: Any, conn: sqlite3.Connection, item_id: int) -> int:
             # Ещё рано: досылкой займётся контур отложенной отдачи.
             continue
         if not await bot.send(store.target_of(conn, hit.user_id), message(item, hit),
-                              keyboard=enrich.keyboard(item_id)):
+                              keyboard=keyboard(item_id, hit.topic_id)):
             continue
         record(conn, item_id, hit.user_id, hit.topic_id, "сырое")
+        got.add(hit.user_id)
         if not sent and not item.get("sent_at"):
             # Метка ставится по первому получателю: наша задержка кончается
             # здесь, а не на последнем человеке в списке [NEWS-001].
             store.stamp(conn, item_id, "sent_at", store.now())
+        sent += 1
+    for line in store.feed_subscribers(conn, item.get("source")):
+        user_id = int(line["user_id"])
+        if user_id in knew or user_id in got or получил(conn, item_id, user_id):
+            continue
+        if already(conn, item_id, user_id, "лента") or not wants(conn, user_id, "лента"):
+            continue
+        if not ready(conn, user_id, item_id):
+            continue
+        if not появился_после(conn, item_id, line["created_at"]):
+            continue
+        if not await bot.send(store.target_of(conn, user_id), feed_message(item),
+                              keyboard=enrich.keyboard(item_id)):
+            continue
+        record(conn, item_id, user_id, None, "лента")
+        got.add(user_id)
         sent += 1
     if sent:
         log.info("разослано %s: %s", sent, str(item.get("title"))[:80])
@@ -261,5 +352,5 @@ def record(conn: sqlite3.Connection, item_id: int, user_id: int, topic_id: int, 
 
 
 __all__ = ("LABEL", "NOTICE", "allowed", "already", "also_message", "message", "ready",
-           "record", "send_also",
+           "record", "send_also", "feed_message", "keyboard", "получил", "появился_после",
            "send_change", "send_item", "send_to", "subscribers", "wants")

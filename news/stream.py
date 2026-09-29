@@ -22,7 +22,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import search, store, topics
+from . import scope, search, store, topics
 
 # Порядок строк. Названия те же, что видит человек в списке на странице.
 SORTS = ("новые сверху", "старые сверху", "по изданию", "по задержке")
@@ -123,7 +123,12 @@ def link(flt: Filter, **changes: Any) -> str:
     return "/лента?" + urllib.parse.urlencode(pairs)
 
 
-def _words_of_topic(conn: Any, topic_id: int) -> tuple[str, list[str]]:
+def _words_of_topic(conn: Any, topic_id: int,
+                    user_id: int = 0) -> tuple[str, list[str]]:
+    """Слова и издания темы. Чужую тему не читаем: адрес с её номером —
+    тоже дверь, и за ней чужие слова."""
+    if user_id and not scope.тему_можно(conn, user_id, int(topic_id)):
+        return "", []
     row = conn.execute("SELECT words, sources FROM topics WHERE id = ?", (topic_id,)).fetchone()
     if row is None:
         return "", []
@@ -133,8 +138,13 @@ def _words_of_topic(conn: Any, topic_id: int) -> tuple[str, list[str]]:
     return "({})".format(" OR ".join(parts)) if parts else "", codes
 
 
-def select(conn: Any, flt: Filter) -> list[dict[str, Any]]:
-    """Материалы под фильтр. Пустой список — мы ничего такого не видели."""
+def select(conn: Any, flt: Filter, user_id: int = 0) -> list[dict[str, Any]]:
+    """Материалы под фильтр. Пустой список — мы ничего такого не видели.
+
+    Личная область видимости — тот же ряд ограничений, что и у поиска:
+    свои издания и то, что человеку приходило. Без номера (0) выборка
+    остаётся служебной, для сторожей и внутренних нужд.
+    """
     where: list[str] = []
     params: list[Any] = []
     expression = ""
@@ -144,7 +154,7 @@ def select(conn: Any, flt: Filter) -> list[dict[str, Any]]:
             return []
     codes = list(flt.sources)
     if flt.topic_id:
-        group, topic_codes = _words_of_topic(conn, flt.topic_id)
+        group, topic_codes = _words_of_topic(conn, flt.topic_id, user_id)
         if not group:
             return []
         expression = "{} AND {}".format(expression, group) if expression else group
@@ -173,6 +183,9 @@ def select(conn: Any, flt: Filter) -> list[dict[str, Any]]:
         params.append(flt.until)
     if flt.only_original:
         where.append("i.dup_of IS NULL")
+    хвост, параметры_области = scope.условие(conn, user_id)
+    if хвост:
+        where.append(хвост)
     sql = (
         "SELECT i.id, i.url, i.source, i.title, i.lead, i.published_at, i.listed_at, i.dup_of, "
         "(SELECT COUNT(*) FROM item_revisions r WHERE r.item_id = i.id) AS revisions, "
@@ -182,6 +195,7 @@ def select(conn: Any, flt: Filter) -> list[dict[str, Any]]:
         where=(" WHERE " + " AND ".join(where)) if where else "",
         order=ORDER.get(flt.sort, ORDER["новые сверху"]),
     )
+    params.extend(параметры_области)
     params.append(min(PER_PAGE + 1, MAX_ROWS))
     params.append(flt.offset)
     rows = conn.execute(sql, params).fetchall()
